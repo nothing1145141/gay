@@ -4,11 +4,14 @@
 内容分区（卷标注释可快速定位）：
   1. 色彩空间工具      2. 参数模型        3. 基础调整
   4. 曲线              5. 颜色分级        6. 取色器
-  7. 效果调节（锐度/清晰度/去朦胧）        8. 蒙版
-  9. 直方图           10. 处理流水线
+  7. 效果调节（清晰度/降噪/锐度/去朦胧）  8. 蒙版（含曲线/色轮/取色器局部化）
+  8b. 仿制图章         9. 直方图          10. 处理流水线
 
 流水线顺序（float32 线性光空间）：
     白平衡 -> 基础 -> 效果 -> 曲线 -> 颜色分级 -> 蒙版局部调整 -> 取色
+
+纯逐像素的阶段（白平衡/基础/黑白/曲线/颜色分级）可走 OpenCL GPU 路径
+（gpu.py，可选），含效果/蒙版/取色器时自动回退 CPU 分块并行。
 """
 from __future__ import annotations
 
@@ -84,8 +87,8 @@ def linear_to_rgb8(lin: np.ndarray) -> np.ndarray:
 CURVE_CHANNELS = ("master", "red", "green", "blue")
 GRADING_RANGES = ("shadows", "midtones", "highlights", "global")
 
-# 效果字段（锐度/清晰度/去朦胧）
-EFFECT_FIELDS = ("clarity", "sharpen", "dehaze")
+# 效果字段（清晰度/降噪/锐度/去朦胧）
+EFFECT_FIELDS = ("clarity", "denoise", "sharpen", "dehaze")
 
 # 取色器预设色相：名称 -> 色相（度）
 HS_PRESETS = (("红", 0.0), ("橙", 30.0), ("黄", 60.0), ("绿", 120.0),
@@ -123,7 +126,11 @@ class PickerState:
 
 @dataclass
 class MaskAdjustments:
-    """蒙版内部署的局部调整（字段名与 Adjustments 一致，便于直接复用算子）。"""
+    """蒙版内部署的局部调整（字段名与 Adjustments 一致，便于直接复用算子）。
+
+    除基础影调与效果外，还带曲线/颜色分级/取色器——蒙版内跑与全局相同的
+    mini 流水线，只是作用范围被蒙版限制。
+    """
 
     exposure: float = 0.0
     contrast: float = 0.0
@@ -136,14 +143,29 @@ class MaskAdjustments:
     saturation: float = 0.0
     vibrance: float = 0.0
     clarity: float = 0.0
+    denoise: float = 0.0
     sharpen: float = 0.0
     dehaze: float = 0.0
 
+    curves: dict = field(default_factory=default_curves)
+    blend: float = 50.0
+    wheels: dict = field(default_factory=lambda: {r: WheelState() for r in GRADING_RANGES})
+    pickers: list = field(default_factory=list)
+
     def is_default(self) -> bool:
-        return all(getattr(self, f) == 0.0 for f in (
-            "exposure", "contrast", "highlights", "shadows", "whites", "blacks",
-            "temperature", "tint", "saturation", "vibrance",
-            "clarity", "sharpen", "dehaze"))
+        if any(getattr(self, f) != 0.0 for f in (
+                "exposure", "contrast", "highlights", "shadows", "whites", "blacks",
+                "temperature", "tint", "saturation", "vibrance",
+                "clarity", "denoise", "sharpen", "dehaze")):
+            return False
+        for pts in self.curves.values():
+            if [tuple(p) for p in pts] != [tuple(p) for p in _DIAGONAL]:
+                return False
+        if any(w.saturation or w.luminance for w in self.wheels.values()):
+            return False
+        if any(p.hue_shift or p.saturation or p.luminance for p in self.pickers):
+            return False
+        return True
 
 
 @dataclass
@@ -206,6 +228,7 @@ class Adjustments:
 
     # ---- 效果 ----
     clarity: float = 0.0       # -100..100 清晰度（中频局部对比）
+    denoise: float = 0.0       # 0..100    降噪（感知域双边缘滤波）
     sharpen: float = 0.0       # 0..100    锐度（USM）
     dehaze: float = 0.0        # -100..100 去朦胧
 
@@ -234,7 +257,7 @@ class Adjustments:
         """全部为默认值时可直接跳过处理（快速预览 / 保存原图）。"""
         for name in ("temperature", "tint", "exposure", "contrast", "highlights",
                      "shadows", "whites", "blacks", "saturation", "vibrance",
-                     "clarity", "sharpen", "dehaze", "blackwhite"):
+                     "clarity", "denoise", "sharpen", "dehaze", "blackwhite"):
             if getattr(self, name) != 0.0:
                 return False
         for pts in self.curves.values():
@@ -262,7 +285,8 @@ def _mul_(out: np.ndarray, w: np.ndarray, k: float):
     out *= t[..., None]
 
 
-def _wb_(out: np.ndarray, temperature: float, tint: float):
+def _wb_gains(temperature: float, tint: float) -> np.ndarray:
+    """色温/色调 -> RGB 增益（几何均值归一化保护曝光）。"""
     t = float(temperature) / 100.0
     ti = float(tint) / 100.0
     gains = np.array([
@@ -271,7 +295,11 @@ def _wb_(out: np.ndarray, temperature: float, tint: float):
         1.0 - t * 0.35 + ti * 0.10,   # B：偏蓝方向
     ], dtype=np.float32)
     gains /= np.cbrt(np.prod(gains))  # 保持整体亮度大致不变
-    out *= gains
+    return gains
+
+
+def _wb_(out: np.ndarray, temperature: float, tint: float):
+    out *= _wb_gains(temperature, tint)
 
 
 def apply_white_balance(img: np.ndarray, temperature: float, tint: float) -> np.ndarray:
@@ -788,7 +816,7 @@ def apply_pickers(img: np.ndarray, pickers) -> np.ndarray:
 
 
 # ======================================================================
-# 7. 效果调节（清晰度 / 锐度 / 去朦胧）
+# 7. 效果调节（清晰度 / 降噪 / 锐度 / 去朦胧）
 # ======================================================================
 
 
@@ -821,6 +849,40 @@ def apply_sharpen(img: np.ndarray, amount: float) -> np.ndarray:
     blur = cv2.GaussianBlur(img, (0, 0), sigmaX=0.8)
     a = np.float32(np.clip(amount / 100.0, 0.0, 1.0) * 1.2)
     return img + (img - blur) * a
+
+
+def _gamma_encode(x: np.ndarray) -> np.ndarray:
+    """sRGB 伽马编码，不裁剪上界（>1 的线性值可逆映射，供域转换用）。
+
+    与 to_linear 严格互逆：lin = ((γ+0.055)/1.055)^2.4  <=>  γ = 1.055·lin^(1/2.4) - 0.055。
+    """
+    x = np.maximum(np.asarray(x, dtype=np.float32), np.float32(0.0))
+    out = x ** np.float32(1.0 / 2.4)
+    out *= np.float32(1.055)
+    out -= np.float32(0.055)
+    low = x * np.float32(12.92)
+    np.copyto(out, low, where=x <= np.float32(0.0031308))
+    return out
+
+
+def _denoise_sigmas(amount: float) -> tuple:
+    """降噪强度 -> 双边滤波 (sigmaColor, sigmaSpace)，均在感知域。"""
+    a = float(np.clip(amount / 100.0, 0.0, 1.0))
+    return 0.025 + 0.175 * a, 2.0 + 8.0 * a
+
+
+def apply_denoise(img: np.ndarray, amount: float) -> np.ndarray:
+    """降噪：感知域双边缘滤波（bilateral），保边去噪。
+
+    在 sRGB 感知域滤波（噪声的视觉强度在该域近似均匀），再转回线性光；
+    sigma 随强度增长，0 为恒等。分块并行时依赖 halo（见 mask_halo）。
+    """
+    if amount == 0:
+        return img
+    sigma_color, sigma_space = _denoise_sigmas(amount)
+    x = _gamma_encode(img)
+    out = cv2.bilateralFilter(x, 0, sigma_color, sigma_space)
+    return to_linear(out)
 
 
 def apply_dehaze(img: np.ndarray, amount: float, A: float | None = None,
@@ -868,14 +930,16 @@ def apply_dehaze(img: np.ndarray, amount: float, A: float | None = None,
 
 def apply_effects(img: np.ndarray, params, low: np.ndarray | None = None,
                   stats: "GlobalStats | None" = None) -> np.ndarray:
-    """按顺序应用效果调节；params 只需具备 clarity/sharpen/dehaze 字段。
+    """按顺序应用效果调节；params 只需具备
+    clarity/denoise/sharpen/dehaze 字段。
 
     low 为预先算好的低频图（清晰度用，见 LowResRenderer）；
     stats 提供全局统计（去朦胧的大气光与平滑半径，见 GlobalStats）。
     """
-    if not (params.clarity or params.sharpen or params.dehaze):
+    if not (params.clarity or params.denoise or params.sharpen or params.dehaze):
         return img
     out = apply_clarity(img, params.clarity, low)
+    out = apply_denoise(out, params.denoise)
     out = apply_sharpen(out, params.sharpen)
     if stats is not None:
         out = apply_dehaze(out, params.dehaze, stats.A, stats.sigma)
@@ -1106,8 +1170,10 @@ def apply_masked_adjustments(img: np.ndarray, masks, renderer: "MaskRenderer | N
                               stats: "GlobalStats | None" = None) -> np.ndarray:
     """按顺序应用各蒙版的局部调整（蒙版内做 mini 流水线后按蒙版混合）。
 
+    mini 流水线与全局一致：基础 -> 效果 -> 曲线 -> 颜色分级 -> 取色器；
     renderer 提供时按行区间复用低分辨率蒙版（分块安全）；
     low / stats 分别提供低频图与全局统计，供蒙版内的清晰度/去朦胧使用。
+    曲线/色轮/取色器均为逐像素算子，分块无需额外 halo。
     """
     out = img
     if y1 is None:
@@ -1121,6 +1187,9 @@ def apply_masked_adjustments(img: np.ndarray, masks, renderer: "MaskRenderer | N
             mask = render_mask(m, img.shape[:2])
         local = apply_basic(img, m.adj)
         local = apply_effects(local, m.adj, low, stats)
+        local = apply_curves_fast(local, m.adj.curves)
+        local = apply_color_grading(local, m.adj.wheels, m.adj.blend)
+        local = apply_pickers(local, m.adj.pickers)
         if out is img:
             out = np.array(img, dtype=np.float32, copy=True)
         w3 = mask[..., None]
@@ -1129,11 +1198,59 @@ def apply_masked_adjustments(img: np.ndarray, masks, renderer: "MaskRenderer | N
 
 
 def mask_halo(params, h: int, w: int) -> int:
-    """分块时所需的重叠像素：仅效果算子（清晰度/锐度/去朦胧）的模糊需要邻域。
+    """分块时所需的重叠像素：效果算子的模糊需要邻域。
 
+    清晰度/锐度/去朦胧取 64；降噪按双边滤波半径（≈2σ）另计，二者取大。
     蒙版由 MaskRenderer 在低分辨率全局渲染，不产生接缝，因此不需要 halo。
     """
-    return 64 if (params.clarity or params.sharpen or params.dehaze) else 0
+    halo = 64 if (params.clarity or params.sharpen or params.dehaze) else 0
+    if getattr(params, "denoise", 0):
+        halo = max(halo, int(_denoise_sigmas(params.denoise)[1] * 2.0) + 6)
+    return halo
+
+
+# ======================================================================
+# 8b. 仿制图章（像素级内容修改，在流水线之前作用于源图）
+# ======================================================================
+
+
+def _disc_alpha(radius: int, feather: float = 0.45) -> np.ndarray:
+    """圆形羽化 alpha 盘 (2r+1, 2r+1)：1 = 完全复制，边缘 smoothstep 到 0。"""
+    r = max(int(radius), 1)
+    yy, xx = np.mgrid[-r:r + 1, -r:r + 1].astype(np.float32)
+    d = np.sqrt(xx * xx + yy * yy) / np.float32(r)
+    a = np.float32(1.0) - smoothstep(np.float32(1.0 - feather), np.float32(1.0), d)
+    return a.astype(np.float32)
+
+
+def clone_stamp(img: np.ndarray, src_px, dst_px, radius: float,
+                feather: float = 0.45) -> None:
+    """仿制图章：把以 src_px 为中心的圆形区域羽化复制到 dst_px（原地修改）。
+
+    坐标为像素 (x, y)；radius 为像素半径。以目标窗口为基准求三重交集
+    （图像范围 × 源窗口范围 × 目标窗口范围），源/目标重叠时先取快照再混合，
+    越界部分自动裁剪。
+    """
+    h, w = img.shape[:2]
+    r = max(1, int(round(radius)))
+    alpha = _disc_alpha(r, feather)
+    sx, sy = int(round(src_px[0])), int(round(src_px[1]))
+    dx, dy = int(round(dst_px[0])), int(round(dst_px[1]))
+    oy, ox = sy - dy, sx - dx                     # 目标像素 -> 源像素偏移
+    dy0, dx0 = dy - r, dx - r
+    y0 = max(dy0, 0, -oy)
+    y1 = min(dy0 + 2 * r + 1, h, h - oy)
+    x0 = max(dx0, 0, -ox)
+    x1 = min(dx0 + 2 * r + 1, w, w - ox)
+    if y0 >= y1 or x0 >= x1:
+        return
+    a = alpha[y0 - dy0:y1 - dy0, x0 - dx0:x1 - dx0][..., None]
+    patch = img[y0 + oy:y1 + oy, x0 + ox:x1 + ox].astype(np.float32)  # 先快照
+    dst = img[y0:y1, x0:x1]
+    blended = dst.astype(np.float32)
+    blended *= (np.float32(1.0) - a)
+    blended += patch * a
+    dst[...] = np.clip(blended + np.float32(0.5), 0, 255).astype(np.uint8)
 
 
 # ======================================================================
@@ -1159,17 +1276,20 @@ def linear_histograms(rgb8: np.ndarray) -> dict:
 
 
 # ======================================================================
-# 10. 处理流水线（可分块并行）
+# 10. 处理流水线（可分块并行；纯逐像素阶段可选 OpenCL GPU 路径，见 gpu.py）
 # ======================================================================
 
 # 拖动时处理的降采样图最长边
 PREVIEW_MAX_EDGE = 1200
 
-# 超过该像素数才启用多线程（小图开销不划算）
-PARALLEL_MIN_PIXELS = 2_000_000
-_MAX_WORKERS = 8
+# 超过该像素数才启用多线程（小图开销不划算；预览图 1200px ≈ 1~2MP 也能并行）
+PARALLEL_MIN_PIXELS = 600_000
+_MAX_WORKERS = max(1, min(32, os.cpu_count() or 1))
 
 _EXECUTOR: ThreadPoolExecutor | None = None
+
+# 环境变量 PHOTOLAB_NO_GPU=1 强制关闭 GPU 路径
+_GPU_ENABLED = os.environ.get("PHOTOLAB_NO_GPU", "") != "1"
 
 
 def _executor() -> ThreadPoolExecutor:
@@ -1191,6 +1311,43 @@ def downscale_max_edge(rgb8: np.ndarray, max_edge: int = PREVIEW_MAX_EDGE) -> np
     scale = max_edge / float(long_edge)
     size = (max(1, int(round(w * scale))), max(1, int(round(h * scale))))
     return cv2.resize(rgb8, size, interpolation=cv2.INTER_AREA)
+
+
+def rgb8_to_linear_mt(rgb8: np.ndarray) -> np.ndarray:
+    """rgb8_to_linear 的多线程版本（逐像素算子，分块结果与单线程一致）。
+
+    打开大图时 sRGB->线性光转换本身就要上百毫秒，分块到线程池可明显缩短
+    预览首帧延迟；小图直接走单线程。
+    """
+    h, w = rgb8.shape[:2]
+    if h * w < PARALLEL_MIN_PIXELS or _MAX_WORKERS <= 1:
+        return rgb8_to_linear(rgb8)
+    out = np.empty((h, w, 3), np.float32)
+    bounds = np.linspace(0, h, _MAX_WORKERS + 1).astype(int)
+
+    def work(i: int):
+        y0, y1 = int(bounds[i]), int(bounds[i + 1])
+        if y1 > y0:
+            out[y0:y1] = rgb8_to_linear(rgb8[y0:y1])
+
+    list(_executor().map(work, range(_MAX_WORKERS)))
+    return out
+
+
+def _gpu_eligible(params) -> bool:
+    """纯逐像素阶段（无效果/蒙版/取色器）才交给 GPU，避免来回搬运抵消收益。"""
+    return not (params.masks or params.pickers
+                or params.clarity or params.denoise
+                or params.sharpen or params.dehaze)
+
+
+def _try_gpu(params, lin: np.ndarray) -> np.ndarray | None:
+    """尝试 GPU 路径（gpu.py 可选依赖）；任何失败都静默回退 CPU。"""
+    try:
+        from gpu import process_simple
+    except Exception:
+        return None
+    return process_simple(params, lin)
 
 
 def _process_rows(params, lin: np.ndarray, y0: int, y1: int, pad: int,
@@ -1233,11 +1390,16 @@ def process_linear(params, lin: np.ndarray) -> np.ndarray:
     if params.is_default():
         return linear_to_rgb8(lin)
 
+    if _GPU_ENABLED and _gpu_eligible(params):
+        out = _try_gpu(params, lin)
+        if out is not None:
+            return out
+
     h, w = lin.shape[:2]
     pad = mask_halo(params, h, w)
     workers = 1
     if h * w >= PARALLEL_MIN_PIXELS:
-        workers = int(min(_MAX_WORKERS, max(1, os.cpu_count() or 1)))
+        workers = _MAX_WORKERS
     parallel = workers > 1 and h > 2 * pad
 
     # 自己按行分块并行时，限制 OpenCV 内部线程，避免 8x16 线程互相争抢

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
 import traceback
 
@@ -14,6 +15,7 @@ import cv2
 import numpy as np
 
 import core
+import auto
 from PySide6.QtCore import QTimer, Qt, Signal
 from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import (QButtonGroup, QFileDialog, QFrame, QGridLayout,
@@ -68,6 +70,7 @@ class BasicPanel(QWidget):
         )),
         ("效果", (
             ("清晰度", "clarity", -100, 100, 0),
+            ("降噪", "denoise", 0, 100, 0),
             ("锐度", "sharpen", 0, 100, 0),
             ("去朦胧", "dehaze", -100, 100, 0),
         )),
@@ -559,6 +562,7 @@ MASK_LOCAL_ROWS = (
     ("色调", "tint", -100, 100, 0, ""),
     ("饱和度", "saturation", -100, 100, 0, ""),
     ("清晰度", "clarity", -100, 100, 0, ""),
+    ("降噪", "denoise", 0, 100, 0, ""),
     ("锐度", "sharpen", 0, 100, 0, ""),
     ("去朦胧", "dehaze", -100, 100, 0, ""),
 )
@@ -743,6 +747,7 @@ class MaskPanel(QWidget):
         if self._selected is not None and self._selected >= len(self._params.masks):
             self._selected = None
         self.sync()
+        self.selectionChanged.emit(self._selected if self._selected is not None else -1)
         self.committed.emit()
 
     # ------------------------------------------------------------ 参数区
@@ -929,6 +934,43 @@ class MaskPanel(QWidget):
 
 
 # ======================================================================
+# 4c. 仿制图章面板
+# ======================================================================
+
+class StampPanel(QWidget):
+    sizeChanged = Signal(float)
+    undoRequested = Signal()
+    clearRequested = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(4, 4, 4, 4)
+        lay.setSpacing(6)
+
+        hint = QLabel("先在图像上 Alt+点击 取样源点，再左键涂抹复制。\n"
+                      "再次 Alt+点击 重新取样；Esc 退出图章模式。")
+        hint.setObjectName("dim")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+
+        self.size_row = SliderRow("笔刷大小", 1, 100, 12, default_value=12.0)
+        self.size_row.valueChanged.connect(self.sizeChanged)
+        lay.addWidget(self.size_row)
+
+        btns = QHBoxLayout()
+        undo = QPushButton("撤销一笔")
+        undo.clicked.connect(self.undoRequested)
+        clear = QPushButton("清除全部")
+        clear.clicked.connect(self.clearRequested)
+        btns.addWidget(undo)
+        btns.addWidget(clear)
+        btns.addStretch(1)
+        lay.addLayout(btns)
+        lay.addStretch(1)
+
+
+# ======================================================================
 # 5. 右侧总面板（可折叠分区）
 # ======================================================================
 
@@ -943,6 +985,9 @@ class AdjustmentPanel(QWidget):
         self.grading = GradingPanel()
         self.picker = PickerPanel()
         self.mask = MaskPanel()
+        self.stamp = StampPanel()
+        self._global = None
+        self._mask_adj = None
 
         for p in (self.basic, self.curve, self.grading, self.picker):
             p.changed.connect(self.changed)
@@ -952,12 +997,13 @@ class AdjustmentPanel(QWidget):
 
         titles = {BasicPanel: "基础", CurvePanel: "曲线",
                   GradingPanel: "颜色分级", PickerPanel: "取色器",
-                  MaskPanel: "蒙版"}
+                  MaskPanel: "蒙版", StampPanel: "仿制图章"}
         container = QWidget()
         cl = QVBoxLayout(container)
         cl.setContentsMargins(0, 0, 0, 0)
         cl.setSpacing(8)
-        for p in (self.basic, self.curve, self.grading, self.picker, self.mask):
+        for p in (self.basic, self.curve, self.grading, self.picker,
+                  self.mask, self.stamp):
             cl.addWidget(CollapsibleSection(titles[type(p)], p, expanded=True))
         cl.addStretch(1)
 
@@ -969,8 +1015,19 @@ class AdjustmentPanel(QWidget):
         outer.addWidget(scroll)
 
     def set_params(self, params: Adjustments):
+        self._global = params
+        self._mask_adj = None
         for p in (self.basic, self.curve, self.grading, self.picker, self.mask):
             p.set_params(params)
+
+    def set_mask_target(self, mask_adj):
+        """选中蒙版时，曲线/色轮/取色器三个分区改编辑该蒙版的局部参数。"""
+        self._mask_adj = mask_adj
+        target = mask_adj if mask_adj is not None else self._global
+        if target is None:
+            return
+        for p in (self.curve, self.grading, self.picker):
+            p.set_params(target)
 
     def sync(self):
         for p in (self.basic, self.curve, self.grading, self.picker, self.mask):
@@ -985,6 +1042,9 @@ class AdjustmentPanel(QWidget):
 # ======================================================================
 
 class MainWindow(QMainWindow):
+    aiDone = Signal(dict, str, str)        # (参数字典, 说明, 模型描述)
+    aiError = Signal(str)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("PhotoLab — 照片调色")
@@ -1001,7 +1061,6 @@ class MainWindow(QMainWindow):
         self._save_path: str | None = None
         self._save_rid = -1
         self._last_hist_time = 0.0
-        self._last_overlay_time = 0.0
         self._last_overlay_time = 0.0
 
         # ---------------- 后台处理线程 ----------------
@@ -1021,6 +1080,8 @@ class MainWindow(QMainWindow):
         self.panel.committed.connect(self._on_params_committed)
         self.panel.picker.pickRequested.connect(self._on_pick_requested)
         self.panel.picker.pickCancelled.connect(self._on_pick_cancelled)
+        self.aiDone.connect(self._on_ai_done)
+        self.aiError.connect(self._on_ai_error)
 
         # ---- 蒙版 ----
         self._mask_sel: int | None = None
@@ -1038,6 +1099,24 @@ class MainWindow(QMainWindow):
         self.preview.radialAngleMoved.connect(self._on_radial_angle)
         self.preview.brushStrokePoint.connect(self._on_brush_point)
         self.preview.brushStrokeFinished.connect(self._on_brush_finished)
+
+        # ---- 仿制图章 ----
+        self._clone_src = None          # 取样源点（归一化）
+        self._clone_offset = None       # 对齐偏移（归一化，PS 对齐模式）
+        self._clone_size = 12.0
+        self._clone_ops: list = []      # 已提交笔画 (src, offset, dests, size)
+        self._stroke_dest: list = []    # 当前笔画目标点
+        self._stroke_applied = 0        # 当前笔画已落盘的点数
+        self._last_stamp_time = 0.0
+        self._retouch_full: np.ndarray | None = None
+        self._retouch_preview: np.ndarray | None = None
+        self.preview.cloneSampled.connect(self._on_clone_sampled)
+        self.preview.cloneStrokePoint.connect(self._on_clone_point)
+        self.preview.cloneStrokeFinished.connect(self._on_clone_finished)
+        self.panel.stamp.sizeChanged.connect(self._on_stamp_size)
+        self.panel.stamp.undoRequested.connect(self._on_stamp_undo)
+        self.panel.stamp.clearRequested.connect(self._on_stamp_clear)
+        self.preview.set_stamp_info(self._clone_size)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self.preview)
@@ -1125,6 +1204,26 @@ class MainWindow(QMainWindow):
         self.act_bw.triggered.connect(self._toggle_blackwhite)
         tb.addAction(self.act_bw)
 
+        tb.addSeparator()
+
+        self.act_stamp = QAction("仿制图章", self)
+        self.act_stamp.setCheckable(True)
+        self.act_stamp.setToolTip("仿制图章：Alt+点击取样源点，左键涂抹复制（Esc 退出）")
+        self.act_stamp.triggered.connect(self._toggle_stamp)
+        tb.addAction(self.act_stamp)
+
+        tb.addSeparator()
+
+        act_auto = QAction("自动", self)
+        act_auto.setToolTip("规则版自动调色：灰世界白平衡 + 直方图自动色阶（本地瞬时）")
+        act_auto.triggered.connect(self._auto_rule)
+        tb.addAction(act_auto)
+
+        self.act_ai = QAction("AI 调色", self)
+        self.act_ai.setToolTip("由视觉大模型分析图像并生成调色参数（需联网）")
+        self.act_ai.triggered.connect(self._auto_ai)
+        tb.addAction(self.act_ai)
+
     def _build_statusbar(self):
         sb = self.statusBar()
         self.status_image = QLabel("未打开图像")
@@ -1139,7 +1238,7 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("0"), self, self.preview.zoom_fit)
         QShortcut(QKeySequence("1"), self, self.preview.zoom_one_to_one)
         QShortcut(QKeySequence("Delete"), self, self._delete_selected_picker)
-        QShortcut(QKeySequence("Escape"), self, self._exit_mask_edit)
+        QShortcut(QKeySequence("Escape"), self, self._on_escape)
 
     def _delete_selected_picker(self):
         idx = self.panel.picker._selected
@@ -1206,6 +1305,16 @@ class MainWindow(QMainWindow):
         self.source = np.ascontiguousarray(rgb)
         self.preview_src = downscale_max_edge(self.source, PREVIEW_MAX_EDGE)
 
+        # 新图像：丢弃图章修改
+        self._clone_src = None
+        self._clone_offset = None
+        self._clone_ops.clear()
+        self._stroke_dest.clear()
+        self._stroke_applied = 0
+        self._retouch_full = None
+        self._retouch_preview = None
+        self.preview.set_clone_marker(None)
+
         self.processor.set_source(PREVIEW, self.preview_src)
         self.processor.set_source(FULL, self.source)
         self.preview.set_full_size(self.source.shape[1], self.source.shape[0])
@@ -1220,6 +1329,88 @@ class MainWindow(QMainWindow):
     def _toggle_blackwhite(self, checked: bool):
         self.params.blackwhite = 100.0 if checked else 0.0
         self._on_params_changed(force_full=True)
+
+    # ------------------------------------------------------------ 自动调色
+    _TONE_FIELDS = ("temperature", "tint", "exposure", "contrast", "highlights",
+                    "shadows", "whites", "blacks", "saturation", "vibrance",
+                    "blackwhite")
+
+    def _apply_adjustment_dict(self, d: dict):
+        """把参数字典（auto.suggest_* 的输出）套到当前参数上并重渲染。"""
+        for name in self._TONE_FIELDS:
+            if name in d:
+                setattr(self.params, name, float(d[name]))
+        for ch, pts in (d.get("curves") or {}).items():
+            self.params.curves[ch] = [tuple(p) for p in pts]
+        for name, w in (d.get("wheels") or {}).items():
+            self.params.wheels[name] = core.WheelState(**w)
+        if "pickers" in d:
+            self.params.pickers = [
+                core.PickerState(hue=p["hue"], color=core.preset_color(p["hue"]),
+                                 span=p["span"], hue_shift=p["hue_shift"],
+                                 saturation=p["saturation"], luminance=p["luminance"])
+                for p in d["pickers"]]
+        self.panel.set_params(self.params)
+        self._sync_toolbar_state()
+        self._on_params_committed()
+
+    def _auto_rule(self):
+        if self.source is None:
+            QMessageBox.information(self, "自动调色", "请先打开一幅图像。")
+            return
+        d = auto.suggest_rule(self.source)
+        self._apply_adjustment_dict(d)
+        self.statusBar().showMessage(
+            "已应用规则自动调色" if d else "已分析：图像无需调整", 5000)
+
+    def _auto_ai(self):
+        if self.source is None:
+            QMessageBox.information(self, "AI 调色", "请先打开一幅图像。")
+            return
+        if not auto.resolve_candidates():
+            QMessageBox.warning(
+                self, "AI 调色",
+                "未找到可用的 AI 端点。\n\n"
+                "可设置环境变量 PHOTOLAB_AI_BASE_URL / PHOTOLAB_AI_KEY / "
+                "PHOTOLAB_AI_MODEL\n（OpenAI 兼容接口 + 视觉模型），"
+                "或在本机 ZCode 中配置供应商后自动发现。")
+            return
+        self.act_ai.setEnabled(False)
+        self.status_proc.setText("AI 分析中…")
+        src = self.source
+
+        def work():
+            try:
+                params, note, desc = auto.suggest_ai(src)
+            except Exception as exc:
+                self.aiError.emit(str(exc))
+                return
+            self.aiDone.emit(params, note, desc)
+
+        self._ai_thread = threading.Thread(target=work, daemon=True)
+        self._ai_thread.start()
+
+    def _on_ai_done(self, params: dict, note: str, desc: str):
+        try:
+            self.act_ai.setEnabled(True)
+            self.status_proc.setText("")
+            if self.source is None:
+                return
+            self._apply_adjustment_dict(params)
+            msg = f"AI 调色完成（{desc.split('@', 1)[0]}）"
+            if note:
+                msg += f"：{note}"
+            self.statusBar().showMessage(msg, 8000)
+        except RuntimeError:               # 窗口已销毁（AI 返回太晚）
+            pass
+
+    def _on_ai_error(self, message: str):
+        try:
+            self.act_ai.setEnabled(True)
+            self.status_proc.setText("")
+            QMessageBox.warning(self, "AI 调色失败", message[:800])
+        except RuntimeError:
+            pass
 
     def reset_adjustments(self):
         self.params = Adjustments()
@@ -1270,7 +1461,9 @@ class MainWindow(QMainWindow):
                 ok, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
             if ok:
                 buf.tofile(path)          # numpy 写入，支持中文路径
-            self.statusBar().showMessage(f"已保存：{path}", 4000)
+                self.statusBar().showMessage(f"已保存：{path}", 4000)
+            else:
+                QMessageBox.warning(self, "保存失败", f"编码失败（不支持的格式？）：\n{path}")
         except Exception:
             traceback.print_exc()
             QMessageBox.warning(self, "保存失败", f"写入失败：\n{path}")
@@ -1367,8 +1560,16 @@ class MainWindow(QMainWindow):
         return self.params.masks[self._mask_sel]
 
     def _on_mask_selected(self, index: int):
-        self._mask_sel = index
+        self._mask_sel = self._clamp_mask_index(index)
+        adj = self._current_mask()
+        self.panel.set_mask_target(adj.adj if adj is not None else None)
         self._refresh_mask_overlays()
+
+    @staticmethod
+    def _clamp_mask_index(index):
+        if index is None or index < 0:
+            return None
+        return index
 
     def _on_mask_edit_requested(self, target):
         if target is None:
@@ -1400,6 +1601,130 @@ class MainWindow(QMainWindow):
         self._mask_edit = None
         self.preview.set_edit_mode("none")
         self.panel.mask.exit_edit()
+
+    # ------------------------------------------------------------ 仿制图章
+    def _toggle_stamp(self, checked: bool):
+        if checked:
+            if self.preview._pick_mode:
+                self.panel.picker.cancel_pick()
+            self._exit_mask_edit()
+            self.statusBar().showMessage(
+                "仿制图章：Alt+点击 取样源点，左键涂抹复制，Esc 退出", 6000)
+        self.preview.set_stamp_mode(checked)
+
+    def _on_escape(self):
+        if self.preview.stamp_mode():
+            self.act_stamp.setChecked(False)
+            self._toggle_stamp(False)
+        else:
+            self._exit_mask_edit()
+
+    def _stamp_radius(self, shape) -> float:
+        return max(1.0, self._clone_size / 100.0 * min(shape[0], shape[1]) * 0.5)
+
+    def _on_stamp_size(self, v: float):
+        self._clone_size = float(v)
+        self.preview.set_stamp_info(self._clone_size)
+
+    def _on_clone_sampled(self, nx: float, ny: float):
+        self._clone_src = (float(nx), float(ny))
+        self._clone_offset = None            # 重新取样后重建对齐偏移
+        self.preview.set_clone_marker(self._clone_src)
+        self.statusBar().showMessage("已取样：左键涂抹复制（Alt+点击可重新取样）", 4000)
+
+    def _on_clone_point(self, nx: float, ny: float):
+        if self._clone_src is None:
+            self.statusBar().showMessage("先按住 Alt 点击图像取样源点", 3000)
+            return
+        if not self._stroke_dest and self._clone_offset is None:
+            # 对齐模式：偏移在第一笔时确立，之后跟随涂抹持续生效
+            self._clone_offset = (float(nx) - self._clone_src[0],
+                                  float(ny) - self._clone_src[1])
+        if self._retouch_full is None:
+            self._retouch_full = self.source.copy()
+            self._retouch_preview = (self.preview_src.copy()
+                                     if self.preview_src is not None else None)
+        self._stroke_dest.append((float(nx), float(ny)))
+        now = time.monotonic()
+        if now - self._last_stamp_time > 0.06:
+            self._last_stamp_time = now
+            self._apply_new_stamp_points(preview=True)
+
+    def _on_clone_finished(self):
+        if (not self._stroke_dest or self._clone_src is None
+                or self._clone_offset is None):
+            self._stroke_dest.clear()
+            return
+        self._apply_new_stamp_points(preview=False)
+        self._clone_ops.append((self._clone_src, self._clone_offset,
+                                list(self._stroke_dest), self._clone_size))
+        self._stroke_dest.clear()
+        self._stroke_applied = 0
+        self.processor.set_source(FULL, self._retouch_full)
+        self._on_params_committed()
+
+    def _apply_new_stamp_points(self, preview: bool):
+        """把当前笔画中尚未落盘的点盖到全图/预览工作副本上。"""
+        new = self._stroke_dest[self._stroke_applied:]
+        if not new or self._retouch_full is None:
+            return
+        src, offset, size = self._clone_src, self._clone_offset, self._clone_size
+        h, w = self._retouch_full.shape[:2]
+        r = self._stamp_radius((h, w))
+        for nx, ny in new:
+            core.clone_stamp(self._retouch_full,
+                             ((nx - offset[0]) * w, (ny - offset[1]) * h),
+                             (nx * w, ny * h), r)
+        self._stroke_applied = len(self._stroke_dest)
+        if preview and self._retouch_preview is not None:
+            ph, pw = self._retouch_preview.shape[:2]
+            rp = max(1.0, size / 100.0 * min(ph, pw) * 0.5)
+            for nx, ny in new:
+                core.clone_stamp(self._retouch_preview,
+                                 ((nx - offset[0]) * pw, (ny - offset[1]) * ph),
+                                 (nx * pw, ny * ph), rp)
+            self.processor.set_source(PREVIEW, self._retouch_preview)
+            self._submit(PREVIEW)
+
+    def _replay_stamps(self):
+        """由原始源图重放全部图章笔画（撤销/清除后调用）。"""
+        self._retouch_full = None
+        self._retouch_preview = None
+        if self._clone_ops and self.source is not None:
+            self._retouch_full = self.source.copy()
+            self._retouch_preview = (self.preview_src.copy()
+                                     if self.preview_src is not None else None)
+            for src, offset, dests, size in self._clone_ops:
+                h, w = self._retouch_full.shape[:2]
+                r = max(1.0, size / 100.0 * min(h, w) * 0.5)
+                for nx, ny in dests:
+                    core.clone_stamp(self._retouch_full,
+                                     ((nx - offset[0]) * w, (ny - offset[1]) * h),
+                                     (nx * w, ny * h), r)
+                if self._retouch_preview is not None:
+                    ph, pw = self._retouch_preview.shape[:2]
+                    rp = max(1.0, size / 100.0 * min(ph, pw) * 0.5)
+                    for nx, ny in dests:
+                        core.clone_stamp(self._retouch_preview,
+                                         ((nx - offset[0]) * pw, (ny - offset[1]) * ph),
+                                         (nx * pw, ny * ph), rp)
+        self.processor.set_source(PREVIEW, self._retouch_preview
+                                  if self._retouch_preview is not None else self.preview_src)
+        self.processor.set_source(FULL, self._retouch_full
+                                  if self._retouch_full is not None else self.source)
+        self._on_params_committed()
+
+    def _on_stamp_undo(self):
+        if self._clone_ops:
+            self._clone_ops.pop()
+        self._replay_stamps()
+
+    def _on_stamp_clear(self):
+        if not self._clone_ops and self._retouch_full is None:
+            return
+        self._clone_ops.clear()
+        self._replay_stamps()
+        self.statusBar().showMessage("已清除全部图章修改", 3000)
 
     def _on_linear_handle(self, handle: int, x1: float, y1: float,
                           x2: float, y2: float):

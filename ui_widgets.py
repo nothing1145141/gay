@@ -18,7 +18,7 @@ from PySide6.QtGui import (QColor, QConicalGradient, QImage, QMouseEvent,
 from PySide6.QtWidgets import (QHBoxLayout, QLabel, QPushButton, QSizePolicy,
                                QSlider, QVBoxLayout, QWidget)
 
-from core import (CURVE_CHANNELS, LUT_SIZE, build_lut, rgb8_to_linear,
+from core import (CURVE_CHANNELS, LUT_SIZE, build_lut, rgb8_to_linear_mt,
                   sanitize_points, process_linear)
 
 # ======================================================================
@@ -311,6 +311,11 @@ class PreviewWidget(QWidget):
     brushStrokePoint = Signal(float, float)         # 归一化 x, y
     brushStrokeFinished = Signal()
 
+    # ---- 仿制图章 ----
+    cloneSampled = Signal(float, float)             # Alt+点击取样（归一化 x, y）
+    cloneStrokePoint = Signal(float, float)         # 涂抹目标点（归一化 x, y）
+    cloneStrokeFinished = Signal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumSize(320, 240)
@@ -336,6 +341,10 @@ class PreviewWidget(QWidget):
         self._panning = False
         self._pan_last = QPointF()
         self._placeholder = True
+        self._stamp_mode = False
+        self._stamp_drawing = False
+        self._stamp_size = 12.0
+        self._clone_marker: QPointF | None = None      # 取样源点（控件坐标）
 
     # ------------------------------------------------------------ 接口
     def set_frame(self, rgb8: np.ndarray | None):
@@ -359,6 +368,34 @@ class PreviewWidget(QWidget):
         if on and self._edit_mode != "none":
             self._edit_mode = "none"
         self.setCursor(Qt.CursorShape.CrossCursor if on else Qt.CursorShape.ArrowCursor)
+
+    # ------------------------------------------------------------ 仿制图章
+    def set_stamp_mode(self, on: bool):
+        self._stamp_mode = on
+        self._stamp_drawing = False
+        if on:
+            self._pick_mode = False
+            self._edit_mode = "none"
+        elif not self._pick_mode:
+            pass
+        self.setCursor(Qt.CursorShape.CrossCursor if on else Qt.CursorShape.ArrowCursor)
+        self.update()
+
+    def stamp_mode(self) -> bool:
+        return self._stamp_mode
+
+    def set_stamp_info(self, size: float):
+        self._stamp_size = float(size)
+        if self._stamp_mode:
+            self.update()
+
+    def set_clone_marker(self, marker):
+        """设置/清除取样源点（归一化坐标 tuple 或 None）。"""
+        if marker is None:
+            self._clone_marker = None
+        else:
+            self._clone_marker = self.frame_point_to_widget(marker[0], marker[1])
+        self.update()
 
     # ------------------------------------------------------------ 蒙版编辑
     def set_edit_mode(self, mode: str, info: dict | None = None):
@@ -490,7 +527,26 @@ class PreviewWidget(QWidget):
 
         # 蒙版编辑辅助线
         self._paint_edit_overlay(p)
+        self._paint_stamp_overlay(p)
         p.end()
+
+    def _paint_stamp_overlay(self, p: QPainter):
+        """图章模式：取样源点十字标记 + 笔刷圈。"""
+        if not self._stamp_mode or self._placeholder:
+            return
+        if self._clone_marker is not None:
+            p.setPen(QPen(QColor("#4cd7e8"), 1.5))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(self._clone_marker, 8.0, 8.0)
+            p.drawLine(QPointF(self._clone_marker.x() - 13, self._clone_marker.y()),
+                       QPointF(self._clone_marker.x() + 13, self._clone_marker.y()))
+            p.drawLine(QPointF(self._clone_marker.x(), self._clone_marker.y() - 13),
+                       QPointF(self._clone_marker.x(), self._clone_marker.y() + 13))
+        if self._brush_cursor is not None:
+            short = max(min(self._frame_size), 1)
+            r = self._scale() * short * (self._stamp_size / 100.0) * 0.5
+            p.setPen(QPen(QColor("#4cd7e8"), 1.0))
+            p.drawEllipse(self._brush_cursor, r, r)
 
     def _paint_edit_overlay(self, p: QPainter):
         if self._edit_mode == "none" or self._placeholder:
@@ -625,6 +681,15 @@ class PreviewWidget(QWidget):
                 self._start_pan(pos)
             return
 
+        if self._stamp_mode:
+            if not self._placeholder:
+                if event.modifiers() & Qt.KeyboardModifier.AltModifier:
+                    self.cloneSampled.emit(*self.widget_to_norm(pos.x(), pos.y()))
+                else:
+                    self._stamp_drawing = True
+                    self.cloneStrokePoint.emit(*self.widget_to_norm(pos.x(), pos.y()))
+            return
+
         if self._edit_mode == "linear":
             hit = self._linear_hit(pos)
             if hit and hit.startswith("handle:"):
@@ -755,6 +820,13 @@ class PreviewWidget(QWidget):
 
     def mouseMoveEvent(self, event):
         pos = event.position()
+        if self._stamp_mode:
+            self._brush_cursor = pos
+            if self._stamp_drawing and not self._placeholder:
+                self.cloneStrokePoint.emit(*self.widget_to_norm(pos.x(), pos.y()))
+            self.update()
+            if not self._panning:
+                return
         if self._edit_mode == "brush":
             if not self._placeholder:
                 self._brush_cursor = pos
@@ -798,6 +870,9 @@ class PreviewWidget(QWidget):
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            if self._stamp_mode and self._stamp_drawing:
+                self._stamp_drawing = False
+                self.cloneStrokeFinished.emit()
             if self._edit_mode == "brush" and self._brush_drawing:
                 self._brush_drawing = False
                 self.brushStrokeFinished.emit()
@@ -1203,7 +1278,7 @@ class ProcessorThread(QThread):
             if cached is not None and cached[0] == gen:
                 lin = cached[1]
             else:
-                lin = rgb8_to_linear(src)
+                lin = rgb8_to_linear_mt(src)
                 self._lin_cache[kind] = (gen, lin)
             out = process_linear(params, lin)
         except Exception:                      # 单个任务失败不应中断线程

@@ -253,6 +253,187 @@ def test_masks():
         img, [m, m2]).max() <= 0.3 * 2 + 1e-6)
 
 
+def test_denoise():
+    rng = np.random.default_rng(9)
+    # 平坦区去噪：噪声图与干净参考都从 uint8 出发（与真实管线一致），
+    # 避免把 uint8 量化偏差算进噪声里
+    clean8 = np.full((96, 96, 3), 162, np.uint8)
+    ref_lin = core.rgb8_to_linear(clean8)
+    noisy8 = np.clip(clean8.astype(np.float32)
+                     + rng.normal(0, 14, clean8.shape).astype(np.float32),
+                     0, 255).astype(np.uint8)
+    lin = core.rgb8_to_linear(noisy8)
+    den = core.apply_denoise(lin, 80)
+    dev_before = float(np.abs(lin - ref_lin).mean())
+    dev_after = float(np.abs(den - ref_lin).mean())
+    check(f"降噪降低噪声偏差（{dev_before:.4f} -> {dev_after:.4f}）",
+          dev_after < dev_before * 0.4)
+    check("降噪 0 为恒等", np.array_equal(core.apply_denoise(lin, 0), lin))
+    check("降噪输出无 NaN", bool(np.all(np.isfinite(den))))
+
+    # 边缘保持：强边缘不应被抹平
+    edge = np.zeros((96, 96, 3), np.float32)
+    edge[:, :48] = 0.2
+    edge[:, 48:] = 0.8
+    noisy_edge = edge + rng.normal(0, 0.03, edge.shape).astype(np.float32)
+    den_e = core.apply_denoise(noisy_edge, 60)
+    gap = abs(float(den_e[:, 16].mean() - den_e[:, 80].mean()))
+    check(f"降噪保留强边缘（两侧差 {gap:.2f}）", gap > 0.35)
+
+    # 流水线与 halo：denoise 参与 is_default，halo 覆盖滤波半径
+    p = core.Adjustments(denoise=50)
+    check("降噪参数使流水线生效", not p.is_default())
+    check("降噪 halo 合理", 6 <= core.mask_halo(p, 3000, 2000)
+          and core.mask_halo(p, 3000, 2000) < 64)
+    rgb = core.linear_to_rgb8(noisy_edge)
+    out = core.process(p, rgb)
+    check("降噪流水线输出范围合法", int(out.min()) >= 0 and int(out.max()) <= 255)
+
+
+def test_auto_rule():
+    import auto
+    # 偏暗、低对比、偏暖的合成图 -> 曝光为正、对比度为正、色温为负
+    h, w = 240, 320
+    yy, xx = np.mgrid[0:h, 0:w]
+    base = 0.10 + 0.06 * (xx / w).astype(np.float32)
+    img = np.stack([base * 1.6, base * 1.05, base * 0.55], axis=-1)
+    rgb8 = core.linear_to_rgb8(img)
+    d = auto.suggest_rule(rgb8)
+    check(f"规则自动:暗图曝光为正（{d.get('exposure')}）", d.get("exposure", 0) > 0.2)
+    check(f"规则自动:低对比图对比度为正（{d.get('contrast')}）", d.get("contrast", 0) > 3)
+    check(f"规则自动:暖偏色被校正（{d.get('temperature')}）", d.get("temperature", 0) < -5)
+    check("规则自动:输出范围合法", all(-105 <= v <= 105 for v in d.values()))
+
+    # 曝光良好的中性渐变图 -> 不应有大动作
+    base2 = 0.08 + 0.80 * (xx / w).astype(np.float32)
+    rgb2 = core.linear_to_rgb8(np.stack([base2] * 3, axis=-1))
+    d2 = auto.suggest_rule(rgb2)
+    check(f"规则自动:正常图曝光接近零（{d2.get('exposure')}）",
+          abs(d2.get("exposure", 0)) < 0.5)
+    check("规则自动:正常图无极端建议", max(abs(v) for v in d2.values()) <= 40)
+
+
+def test_ai_sanitize():
+    import json as _json
+
+    import auto
+    raw = "```json\n" + _json.dumps({
+        "exposure": 99, "contrast": "x", "temperature": -25.6,
+        "curves": {"master": [[0, 0], [0.5, 0.7], [1, 1]], "red": "bad"},
+        "wheels": {"shadows": {"hue": 400, "saturation": 30, "luminance": -10},
+                   "midtones": "bad"},
+        "pickers": [{"hue": 120, "span": 500, "hue_shift": -30,
+                     "saturation": 20, "luminance": 0},
+                    {"hue": "x"}],
+        "note": "提亮并压暖",
+        "unknown_field": 1,
+    }, ensure_ascii=False) + "\n```"
+    d = auto.sanitize_ai_params(auto._extract_json(raw))
+    check("AI 解析:exposure 99 钳到 5", d.get("exposure") == 5.0)
+    check("AI 解析:非法字段被丢弃", "contrast" not in d and "unknown_field" not in d)
+    check("AI 解析:色温保留", d.get("temperature") == -25.6)
+    check("AI 解析:曲线被规整且非法通道被丢弃",
+          d["curves"]["master"][1] == (0.5, 0.7) and "red" not in d["curves"])
+    check("AI 解析:色轮 hue 归一化", d["wheels"]["shadows"]["hue"] == 40.0
+          and "midtones" not in d["wheels"])
+    check("AI 解析:取色器钳制且无效项被丢弃", len(d["pickers"]) == 1
+          and d["pickers"][0]["span"] == 180 and d["pickers"][0]["hue_shift"] == -30)
+    check("AI 解析:空输入安全", auto.sanitize_ai_params(None) == {}
+          and auto.sanitize_ai_params("bad") == {})
+
+
+def test_gpu_matches_cpu():
+    """有 OpenCL GPU 时，GPU 结果必须与 CPU 接近（浮点实现允许微小舍入差）。"""
+    try:
+        import gpu
+    except Exception:
+        gpu = None
+    if gpu is None or not gpu.available():
+        print("  SKIP  （无可用 OpenCL GPU）")
+        return
+    print(f"  （设备：{gpu.device_name()}）")
+    rng = np.random.default_rng(13)
+    rgb = (rng.random((240, 320, 3)) * 255).astype(np.uint8)
+    lin = core.rgb8_to_linear(rgb)
+
+    p = core.Adjustments()
+    p.temperature = 40
+    p.exposure = 0.5
+    p.contrast = 35
+    p.highlights = -20
+    p.shadows = 25
+    p.whites = 15
+    p.blacks = -10
+    p.saturation = 20
+    p.vibrance = 30
+    p.curves["master"] = [(0.0, 0.0), (0.5, 0.6), (1.0, 1.0)]
+    p.wheels["shadows"] = core.WheelState(200, 50, 15)
+    p.wheels["highlights"] = core.WheelState(45, -30, -10)
+    g = core.process_linear(p, lin)          # 应自动走 GPU
+    s = core._process_band(p, lin)           # 单线程 CPU
+    d = int(np.abs(g.astype(int) - s.astype(int)).max())
+    check(f"GPU 与 CPU 结果一致（最大差 {d}/255）", d <= 2)
+
+    p2 = core.Adjustments(blackwhite=100)
+    g2 = core.process_linear(p2, lin)
+    s2 = core._process_band(p2, lin)
+    d2 = int(np.abs(g2.astype(int) - s2.astype(int)).max())
+    check(f"黑白模式 GPU 与 CPU 一致（最大差 {d2}/255）", d2 <= 2)
+    check("GPU 路径输出为灰度",
+          float(np.abs(g2[..., 0].astype(int) - g2[..., 1]).max()) <= 2)
+
+
+def test_mask_advanced():
+    """蒙版内的曲线 / 色轮 / 取色器局部调整。"""
+    img = np.full((64, 64, 3), 0.5, np.float32)
+    m = core.MaskState(kind="radial", cx=0.5, cy=0.5, radius=0.4, feather=5)
+    m.adj.curves["master"] = [(0.0, 0.0), (0.5, 0.25), (1.0, 1.0)]
+    out = core.apply_masked_adjustments(img, [m])
+    check("蒙版内曲线压暗中间调", out[32, 32].mean() < 0.4)
+    check("蒙版外曲线不生效", abs(float(out[2, 2].mean()) - 0.5) < 1e-5)
+    check("仅曲线的蒙版非默认", not m.is_trivial())
+
+    img2 = np.full((64, 64, 3), 0.3, np.float32)
+    m2 = core.MaskState(kind="radial", cx=0.5, cy=0.5, radius=0.4, feather=5)
+    m2.adj.wheels["shadows"] = core.WheelState(hue=0.0, saturation=80.0)
+    out2 = core.apply_masked_adjustments(img2, [m2])
+    check("蒙版内色轮偏红", float(out2[32, 32, 0] - img2[32, 32, 0]) > 0.01
+          and float(out2[32, 32, 0] - out2[32, 32, 2]) > 0.02)
+    check("蒙版外色轮不生效", abs(float(out2[2, 2].mean()) - 0.3) < 1e-5)
+
+    img3 = np.zeros((64, 64, 3), np.float32)
+    img3[:, :32] = (0.9, 0.05, 0.05)
+    # 线性蒙版从右向左：左半权重≈1（起点的值为 0，终点的值为 1）
+    m3 = core.MaskState(kind="linear", x1=1.0, y1=0.5, x2=0.0, y2=0.5, feather=5)
+    m3.adj.pickers = [core.PickerState(hue=0.0, span=60.0, saturation=-100.0)]
+    out3 = core.apply_masked_adjustments(img3, [m3])
+    check("蒙版内取色器去饱和", float(np.abs(out3[32, 8, 0] - out3[32, 8, 1]).mean()) <
+          float(np.abs(img3[32, 8, 0] - img3[32, 8, 1]).mean()) * 0.5)
+    check("蒙版外取色器不生效",
+          float(np.abs(out3[32, 60] - img3[32, 60]).max()) < 1e-4)
+    p = core.Adjustments()
+    p.masks = [m]
+    check("含曲线蒙版使流水线生效", not p.is_default())
+
+
+def test_clone_stamp():
+    img = np.zeros((64, 64, 3), np.uint8)
+    img[:, :32] = 200
+    core.clone_stamp(img, (8, 32), (48, 32), 6)
+    check("图章复制源区域内容", img[32, 48, 0] == 200)
+    check("图章不影响远处", img[2, 60, 0] == 0)
+    check("图章边缘羽化过渡", 0 < img[32, 53, 0] < 200)
+
+    img2 = np.full((32, 32, 3), 128, np.uint8)
+    core.clone_stamp(img2, (16, 16), (20, 16), 8)
+    check("源/目标重叠安全", bool(np.all(np.isfinite(img2))) and float(img2.mean()) > 0)
+
+    img3 = np.zeros((40, 40, 3), np.uint8)
+    img3[:20, :20] = 200
+    core.clone_stamp(img3, (4, 4), (38, 38), 10)      # 目标越界
+    check("越界目标自动裁剪不崩溃", img3[39, 39, 0] == 200 and img3[20, 39, 0] == 0)
+
+
 def test_contrast_strength():
     """对比度必须有可见效果（修复"滑块似乎不工作"）。"""
     xs = np.array([0.1, 0.25, 0.5, 0.75, 0.9], np.float32).reshape(1, -1, 1).repeat(3, 2)
@@ -419,6 +600,9 @@ def test_parallel_equals_serial():
     lm = core.MaskState(kind="linear", x1=0.15, y1=0.9, x2=0.85, y2=0.15,
                         feather=35, invert=True)
     lm.adj.temperature = 25
+    lm.adj.pickers = [core.PickerState(hue=210.0, span=50.0, saturation=-40)]
+    rm.adj.curves["master"] = [(0.0, 0.0), (0.5, 0.65), (1.0, 1.0)]
+    rm.adj.wheels["highlights"] = core.WheelState(40, 30, -10)
     p2.masks = [rm, bm, lm]
     par2 = core.process_linear(p2, lin)
     ser2 = core._process_band(p2, lin)
@@ -555,11 +739,13 @@ def run_ui_smoke() -> int:
         window._on_params_committed()
         frame_effects = window._last_frame.copy()
         check("效果调节改变画面", not np.array_equal(frame_effects, frame_preset))
+        window.panel.basic.rows["denoise"].slider.setValue(45)
+        check("降噪参数生效", window.params.denoise == 45)
+        window.panel.basic.rows["denoise"].slider.setValue(0)
         for k in ("clarity", "sharpen", "dehaze"):
             window.panel.basic.rows[k].slider.setValue(0)
 
         # ---- 蒙版 ----
-        wx, wy = image_to_widget(window, *RED_CENTER)
         wx, wy = image_to_widget(window, *RED_CENTER)
         window._on_image_picked(wx, wy)
         check("恢复图像取色", len(window.params.pickers) == 3)
@@ -739,6 +925,39 @@ def run_ui_smoke() -> int:
             window.panel.mask.delete_mask(m)
         check("清理全部蒙版", not window.params.masks)
 
+        # ---- 蒙版目标切换：选中蒙版时曲线/色轮/取色器编辑蒙版参数 ----
+        window.panel.mask.create_mask("radial")
+        m0 = window.params.masks[0]
+        window.panel.curve._on_points_changed("master", [(0.0, 0.0), (0.5, 0.6), (1.0, 1.0)])
+        check("选中蒙版时曲线写入蒙版参数", len(m0.adj.curves["master"]) == 3
+              and len(window.params.curves["master"]) == 2)
+        window.panel.grading._on_sat("shadows", 40)
+        check("选中蒙版时色轮写入蒙版参数", m0.adj.wheels["shadows"].saturation == 40)
+        window.panel.picker.new_preset(120.0)
+        check("选中蒙版时取色点写入蒙版参数", len(m0.adj.pickers) == 1)
+        window.panel.mask.delete_mask(0)
+        check("删除蒙版后曲线面板回到全局",
+              window.panel.curve._params is window.params)
+        check("全局曲线未被污染", len(window.params.curves["master"]) == 2)
+
+        # ---- 仿制图章 ----
+        window._toggle_stamp(True)
+        check("图章模式进入", window.preview.stamp_mode())
+        window.preview.cloneSampled.emit(0.25, 0.25)
+        window.preview.cloneStrokePoint.emit(0.6, 0.6)
+        window.preview.cloneStrokePoint.emit(0.65, 0.6)
+        window.preview.cloneStrokeFinished.emit()
+        check("图章修改像素", window._retouch_full is not None
+              and not np.array_equal(window._retouch_full, window.source))
+        check("图章笔迹已记录", len(window._clone_ops) == 1)
+        check("图章后全图源已切换", window.processor._sources.get("full")
+              is window._retouch_full)
+        window._on_stamp_undo()
+        check("图章撤销还原", window._retouch_full is None
+              and window.processor._sources.get("full") is window.source)
+        window._on_escape()
+        check("Esc 退出图章模式", not window.preview.stamp_mode())
+
         # ---- 黑白模式（顶栏开关）----
         window.act_bw.trigger()                       # 打开
         check("顶栏黑白开关生效", window.params.blackwhite == 100)
@@ -761,6 +980,12 @@ def run_ui_smoke() -> int:
         window._write_image(window._last_frame, out_path)
         check("保存 JPEG 成功", os.path.isfile(out_path) and os.path.getsize(out_path) > 1000)
         check("保存内容尺寸正确", cv2.imread(out_path).shape[:2] == (IMG_H, IMG_W))
+
+        # ---- 自动调色（规则版，不联网）----
+        window._auto_rule()
+        check("规则自动调色生效", window.params.exposure != 0
+              or window.params.contrast != 0 or window.params.temperature != 0)
+        check("AI 调色按钮存在", window.act_ai is not None)
 
         # ---- 重置 ----
         window.reset_adjustments()
@@ -860,10 +1085,16 @@ def main():
     print("== 流水线 ==");      test_pipeline()
     print("== 并行一致性 ==");  test_parallel_equals_serial()
     print("== 效果调节 ==");    test_effects()
+    print("== 降噪 ==");        test_denoise()
     print("== 对比度强度 ==");  test_contrast_strength()
     print("== 去朦胧不发黑 =="); test_dehaze_no_blackout()
     print("== 蒙版 ==");        test_masks()
+    print("== 蒙版高级 ==");    test_mask_advanced()
+    print("== 仿制图章 ==");    test_clone_stamp()
     print("== 径向形状 ==");    test_radial_shape()
+    print("== 自动调色 ==");    test_auto_rule()
+    print("== AI 参数解析 =="); test_ai_sanitize()
+    print("== GPU 一致性 ==");  test_gpu_matches_cpu()
 
     if RUN_UI:
         print("== UI 冒烟 ==")
