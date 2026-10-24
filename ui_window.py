@@ -938,7 +938,8 @@ class MaskPanel(QWidget):
 # ======================================================================
 
 class StampPanel(QWidget):
-    sizeChanged = Signal(float)
+    featherChanged = Signal(float)       # 边缘羽化 0..100
+    newSourceRequested = Signal()
     undoRequested = Signal()
     clearRequested = Signal()
 
@@ -948,26 +949,102 @@ class StampPanel(QWidget):
         lay.setContentsMargins(4, 4, 4, 4)
         lay.setSpacing(6)
 
-        hint = QLabel("先在图像上 Alt+点击 取样源点，再左键涂抹复制。\n"
-                      "再次 Alt+点击 重新取样；Esc 退出图章模式。")
+        hint = QLabel("第一步：在图像上拖出矩形，选取源区域（青色框）。\n"
+                      "第二步：在目标处拖出矩形，源区域内容即缩放覆盖过去。\n"
+                      "Alt+拖动或点「重选源区」重新取样；Esc 退出。")
         hint.setObjectName("dim")
         hint.setWordWrap(True)
         lay.addWidget(hint)
 
-        self.size_row = SliderRow("笔刷大小", 1, 100, 12, default_value=12.0)
-        self.size_row.valueChanged.connect(self.sizeChanged)
-        lay.addWidget(self.size_row)
+        self.feather_row = SliderRow("边缘羽化", 0, 100, 20, default_value=20.0,
+                                     suffix="%")
+        self.feather_row.valueChanged.connect(self.featherChanged)
+        lay.addWidget(self.feather_row)
 
         btns = QHBoxLayout()
-        undo = QPushButton("撤销一笔")
+        resrc = QPushButton("重选源区")
+        resrc.setToolTip("清除当前源矩形，下一次拖动重新选取")
+        resrc.clicked.connect(self.newSourceRequested)
+        undo = QPushButton("撤销一次")
         undo.clicked.connect(self.undoRequested)
         clear = QPushButton("清除全部")
         clear.clicked.connect(self.clearRequested)
+        btns.addWidget(resrc)
         btns.addWidget(undo)
         btns.addWidget(clear)
         btns.addStretch(1)
         lay.addLayout(btns)
         lay.addStretch(1)
+
+
+# ======================================================================
+# 4d. 裁剪工具条（比例 / 拉直 / 应用）
+# ======================================================================
+
+class CropBar(QWidget):
+    """裁剪模式下显示在预览下方：比例预设、拉直角度、输出尺寸、应用/取消。"""
+
+    applyRequested = Signal()
+    cancelRequested = Signal()
+    aspectChanged = Signal(object)      # None（自由）或 float 宽/高
+    angleChanged = Signal(float)
+
+    ASPECTS = (("自由", None), ("原始", "orig"), ("1:1", 1.0), ("3:2", 1.5),
+               ("2:3", 2.0 / 3.0), ("4:3", 4.0 / 3.0), ("3:4", 0.75),
+               ("16:9", 16.0 / 9.0), ("9:16", 9.0 / 16.0))
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(6, 4, 6, 4)
+        lay.setSpacing(8)
+        self._orig_aspect: float | None = None
+
+        self._group = QButtonGroup(self)
+        self._group.setExclusive(True)
+        for label, val in self.ASPECTS:
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setChecked(val is None)
+            btn.setToolTip("裁剪比例" + ("" if val is None else f" {label}"))
+            btn.clicked.connect(lambda _=False, v=val: self._emit_aspect(v))
+            self._group.addButton(btn)
+            lay.addWidget(btn)
+
+        self.angle_row = SliderRow("拉直", -45, 45, 0.0, decimals=1,
+                                    suffix="°", default_value=0.0)
+        self.angle_row.valueChanged.connect(self.angleChanged.emit)
+        lay.addWidget(self.angle_row, 1)
+
+        self.size_label = QLabel("")
+        self.size_label.setObjectName("dim")
+        self.size_label.setMinimumWidth(96)
+        lay.addWidget(self.size_label)
+
+        cancel = QPushButton("取消")
+        cancel.clicked.connect(self.cancelRequested)
+        lay.addWidget(cancel)
+        apply_btn = QPushButton("应用")
+        apply_btn.setToolTip("应用裁剪与拉直（Enter）")
+        apply_btn.clicked.connect(self.applyRequested)
+        lay.addWidget(apply_btn)
+
+    def _emit_aspect(self, val):
+        if val == "orig":
+            val = self._orig_aspect
+        self.aspectChanged.emit(val)
+
+    def set_original_aspect(self, aspect):
+        self._orig_aspect = float(aspect) if aspect else None
+
+    def reset(self):
+        """进入裁剪模式时复位（自由比例、角度 0）。"""
+        self._group.buttons()[0].setChecked(True)
+        self.angle_row.set_value(0.0)
+        self.size_label.setText("")
+
+    def set_output_size(self, w: int, h: int):
+        self.size_label.setText(f"{w} × {h}")
 
 
 # ======================================================================
@@ -1042,8 +1119,11 @@ class AdjustmentPanel(QWidget):
 # ======================================================================
 
 class MainWindow(QMainWindow):
-    aiDone = Signal(dict, str, str)        # (参数字典, 说明, 模型描述)
+    aiDone = Signal(dict, str, str, int)    # (参数字典, 说明, 模型描述, 发起时的图像序号)
     aiError = Signal(str)
+
+    # 蒙版叠加层缓存上限：拖动几何时每个鼠标事件都会产生新缓存项，无上限会吃掉数百 MB
+    _OVERLAY_CACHE_MAX = 16
 
     def __init__(self):
         super().__init__()
@@ -1062,6 +1142,7 @@ class MainWindow(QMainWindow):
         self._save_rid = -1
         self._last_hist_time = 0.0
         self._last_overlay_time = 0.0
+        self._source_serial = 0        # 换图自增，用于丢弃迟到的 AI 结果
 
         # ---------------- 后台处理线程 ----------------
         self.processor = ProcessorThread()
@@ -1100,26 +1181,37 @@ class MainWindow(QMainWindow):
         self.preview.brushStrokePoint.connect(self._on_brush_point)
         self.preview.brushStrokeFinished.connect(self._on_brush_finished)
 
-        # ---- 仿制图章 ----
-        self._clone_src = None          # 取样源点（归一化）
-        self._clone_offset = None       # 对齐偏移（归一化，PS 对齐模式）
-        self._clone_size = 12.0
-        self._clone_ops: list = []      # 已提交笔画 (src, offset, dests, size)
-        self._stroke_dest: list = []    # 当前笔画目标点
-        self._stroke_applied = 0        # 当前笔画已落盘的点数
-        self._last_stamp_time = 0.0
+        # ---- 仿制图章（矩形取样覆盖）----
+        self._stamp_src_rect = None    # 已选源矩形（归一化 x0,y0,x1,y1）
+        self._stamp_feather = 20.0     # 边缘羽化 0..100
+        self._clone_ops: list = []     # 已提交覆盖 (源矩形, 目标矩形, 羽化%)
         self._retouch_full: np.ndarray | None = None
         self._retouch_preview: np.ndarray | None = None
-        self.preview.cloneSampled.connect(self._on_clone_sampled)
-        self.preview.cloneStrokePoint.connect(self._on_clone_point)
-        self.preview.cloneStrokeFinished.connect(self._on_clone_finished)
-        self.panel.stamp.sizeChanged.connect(self._on_stamp_size)
+        self.preview.cloneSourcePicked.connect(self._on_clone_source)
+        self.preview.cloneApplyRequested.connect(self._on_clone_apply)
+        self.panel.stamp.featherChanged.connect(self._on_stamp_feather)
+        self.panel.stamp.newSourceRequested.connect(self._on_stamp_new_source)
         self.panel.stamp.undoRequested.connect(self._on_stamp_undo)
         self.panel.stamp.clearRequested.connect(self._on_stamp_clear)
-        self.preview.set_stamp_info(self._clone_size)
 
+        # ---- 裁剪 / 旋转 ----
+        self._crop_angle = 0.0
+        self.crop_bar = CropBar()
+        self.crop_bar.setVisible(False)
+        self.crop_bar.applyRequested.connect(self._apply_crop)
+        self.crop_bar.cancelRequested.connect(self._cancel_crop)
+        self.crop_bar.aspectChanged.connect(self.preview.set_crop_aspect)
+        self.crop_bar.angleChanged.connect(self._on_crop_angle)
+        self.preview.cropRectChanged.connect(self._on_crop_rect_changed)
+
+        left = QWidget()
+        lv = QVBoxLayout(left)
+        lv.setContentsMargins(0, 0, 0, 0)
+        lv.setSpacing(0)
+        lv.addWidget(self.preview, 1)
+        lv.addWidget(self.crop_bar)
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(self.preview)
+        splitter.addWidget(left)
         splitter.addWidget(self.panel)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 0)
@@ -1214,6 +1306,24 @@ class MainWindow(QMainWindow):
 
         tb.addSeparator()
 
+        self.act_crop = QAction("裁剪", self)
+        self.act_crop.setCheckable(True)
+        self.act_crop.setToolTip("裁剪/拉直：拖动框与手柄调整，选比例、拉直角度，Enter 应用，Esc 取消")
+        self.act_crop.triggered.connect(self._toggle_crop)
+        tb.addAction(self.act_crop)
+
+        act_rotl = QAction("左转90°", self)
+        act_rotl.setToolTip("逆时针旋转 90°（立即应用）")
+        act_rotl.triggered.connect(lambda: self._rotate90(False))
+        tb.addAction(act_rotl)
+
+        act_rotr = QAction("右转90°", self)
+        act_rotr.setToolTip("顺时针旋转 90°（立即应用）")
+        act_rotr.triggered.connect(lambda: self._rotate90(True))
+        tb.addAction(act_rotr)
+
+        tb.addSeparator()
+
         act_auto = QAction("自动", self)
         act_auto.setToolTip("规则版自动调色：灰世界白平衡 + 直方图自动色阶（本地瞬时）")
         act_auto.triggered.connect(self._auto_rule)
@@ -1239,6 +1349,12 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("1"), self, self.preview.zoom_one_to_one)
         QShortcut(QKeySequence("Delete"), self, self._delete_selected_picker)
         QShortcut(QKeySequence("Escape"), self, self._on_escape)
+        QShortcut(QKeySequence("Return"), self, self._crop_enter)
+        QShortcut(QKeySequence("Enter"), self, self._crop_enter)
+
+    def _crop_enter(self):
+        if self.preview.crop_mode():
+            self._apply_crop()
 
     def _delete_selected_picker(self):
         idx = self.panel.picker._selected
@@ -1287,6 +1403,9 @@ class MainWindow(QMainWindow):
         return arr
 
     def load_image(self, path: str):
+        if self.preview.crop_mode() or self.act_crop.isChecked():
+            self.act_crop.setChecked(False)
+            self._close_crop_ui()
         ext = os.path.splitext(path)[1].lower()
         if ext in RAW_EXTENSIONS:
             rgb = self._load_raw(path)
@@ -1304,16 +1423,14 @@ class MainWindow(QMainWindow):
             rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         self.source = np.ascontiguousarray(rgb)
         self.preview_src = downscale_max_edge(self.source, PREVIEW_MAX_EDGE)
+        self._source_serial += 1
 
         # 新图像：丢弃图章修改
-        self._clone_src = None
-        self._clone_offset = None
+        self._stamp_src_rect = None
         self._clone_ops.clear()
-        self._stroke_dest.clear()
-        self._stroke_applied = 0
         self._retouch_full = None
         self._retouch_preview = None
-        self.preview.set_clone_marker(None)
+        self.preview.set_stamp_source(None)
 
         self.processor.set_source(PREVIEW, self.preview_src)
         self.processor.set_source(FULL, self.source)
@@ -1367,33 +1484,38 @@ class MainWindow(QMainWindow):
         if self.source is None:
             QMessageBox.information(self, "AI 调色", "请先打开一幅图像。")
             return
-        if not auto.resolve_candidates():
-            QMessageBox.warning(
-                self, "AI 调色",
-                "未找到可用的 AI 端点。\n\n"
-                "可设置环境变量 PHOTOLAB_AI_BASE_URL / PHOTOLAB_AI_KEY / "
-                "PHOTOLAB_AI_MODEL\n（OpenAI 兼容接口 + 视觉模型），"
-                "或在本机 ZCode 中配置供应商后自动发现。")
-            return
         self.act_ai.setEnabled(False)
         self.status_proc.setText("AI 分析中…")
         src = self.source
+        serial = self._source_serial
 
         def work():
+            # 端点发现含网络请求（每个供应商最多 8s），必须放在后台线程，避免冻结 GUI
             try:
+                if not auto.resolve_candidates():
+                    self.aiError.emit(
+                        "未找到可用的 AI 端点。\n\n"
+                        "可设置环境变量 PHOTOLAB_AI_BASE_URL / PHOTOLAB_AI_KEY / "
+                        "PHOTOLAB_AI_MODEL\n（OpenAI 兼容接口 + 视觉模型），"
+                        "或在本机 ZCode 中配置供应商后自动发现。")
+                    return
                 params, note, desc = auto.suggest_ai(src)
             except Exception as exc:
                 self.aiError.emit(str(exc))
                 return
-            self.aiDone.emit(params, note, desc)
+            self.aiDone.emit(params, note, desc, serial)
 
         self._ai_thread = threading.Thread(target=work, daemon=True)
         self._ai_thread.start()
 
-    def _on_ai_done(self, params: dict, note: str, desc: str):
+    def _on_ai_done(self, params: dict, note: str, desc: str, serial: int):
         try:
             self.act_ai.setEnabled(True)
             self.status_proc.setText("")
+            if serial != self._source_serial:
+                # 分析期间已换图：旧图的结果不能套到新图上
+                self.statusBar().showMessage("图像已更换，AI 调色结果已忽略", 4000)
+                return
             if self.source is None:
                 return
             self._apply_adjustment_dict(params)
@@ -1442,7 +1564,10 @@ class MainWindow(QMainWindow):
         if not os.path.splitext(path)[1]:
             path += ".jpg"
         self._save_path = path
-        self._save_rid = self._submit(FULL)
+        # 保存走 urgent 独立槽位（不会被随后的参数更新覆盖），并停掉空闲
+        # 定时器，防止它在保存任务之后又提交一个普通全图任务造成状态混乱
+        self._full_timer.stop()
+        self._save_rid = self.processor.submit(self.params, FULL, urgent=True)
         self.status_proc.setText("正在渲染全图…")
 
     def _write_image(self, arr: np.ndarray, path: str):
@@ -1609,109 +1734,202 @@ class MainWindow(QMainWindow):
                 self.panel.picker.cancel_pick()
             self._exit_mask_edit()
             self.statusBar().showMessage(
-                "仿制图章：Alt+点击 取样源点，左键涂抹复制，Esc 退出", 6000)
+                "仿制图章：先拖出源矩形，再在目标处拖矩形覆盖；Alt+拖动重选源，Esc 退出", 6000)
         self.preview.set_stamp_mode(checked)
 
     def _on_escape(self):
-        if self.preview.stamp_mode():
+        if self.preview.crop_mode():
+            self._cancel_crop()
+        elif self.preview.stamp_mode():
             self.act_stamp.setChecked(False)
             self._toggle_stamp(False)
         else:
             self._exit_mask_edit()
 
-    def _stamp_radius(self, shape) -> float:
-        return max(1.0, self._clone_size / 100.0 * min(shape[0], shape[1]) * 0.5)
+    # ------------------------------------------------------------ 裁剪 / 旋转
+    def _toggle_crop(self, checked: bool):
+        if checked:
+            if self.source is None:
+                QMessageBox.information(self, "裁剪", "请先打开一幅图像。")
+                self.act_crop.setChecked(False)
+                return
+            if self._comparing:
+                self.act_compare.setChecked(False)
+                self._toggle_compare(False)
+            if self.preview._pick_mode:
+                self.panel.picker.cancel_pick()
+            if self.preview.stamp_mode():
+                self.act_stamp.setChecked(False)
+                self._toggle_stamp(False)
+            self._exit_mask_edit()
+            self._crop_angle = 0.0
+            self.crop_bar.set_original_aspect(self.source.shape[1]
+                                              / self.source.shape[0])
+            self.crop_bar.reset()
+            self.preview.set_crop_mode(True)
+            self._update_crop_max()
+            self.crop_bar.setVisible(True)
+            self.statusBar().showMessage(
+                "裁剪：拖动框/手柄调整，可锁定比例、拉直；Enter 应用，Esc 取消", 6000)
+        else:
+            self._close_crop_ui()
 
-    def _on_stamp_size(self, v: float):
-        self._clone_size = float(v)
-        self.preview.set_stamp_info(self._clone_size)
+    def _close_crop_ui(self):
+        self.preview.set_crop_mode(False)
+        self.crop_bar.setVisible(False)
 
-    def _on_clone_sampled(self, nx: float, ny: float):
-        self._clone_src = (float(nx), float(ny))
-        self._clone_offset = None            # 重新取样后重建对齐偏移
-        self.preview.set_clone_marker(self._clone_src)
-        self.statusBar().showMessage("已取样：左键涂抹复制（Alt+点击可重新取样）", 4000)
+    def _cancel_crop(self):
+        self.act_crop.setChecked(False)
+        self._close_crop_ui()
+        self.statusBar().showMessage("已取消裁剪", 2000)
 
-    def _on_clone_point(self, nx: float, ny: float):
-        if self._clone_src is None:
-            self.statusBar().showMessage("先按住 Alt 点击图像取样源点", 3000)
+    def _update_crop_max(self):
+        """按当前拉直角度计算裁剪框的最大有效区（归一化），传给预览。"""
+        h, w = self.source.shape[:2]
+        x0, y0, x1, y1 = core.fit_rect_in_rotation((0, 0, w, h), (h, w),
+                                                    self._crop_angle)
+        self.preview.set_crop_max((x0 / w, y0 / h, x1 / w, y1 / h))
+
+    def _on_crop_angle(self, angle: float):
+        self._crop_angle = float(angle)
+        self._update_crop_max()
+
+    def _on_crop_rect_changed(self, rect: dict):
+        if self.source is None:
             return
-        if not self._stroke_dest and self._clone_offset is None:
-            # 对齐模式：偏移在第一笔时确立，之后跟随涂抹持续生效
-            self._clone_offset = (float(nx) - self._clone_src[0],
-                                  float(ny) - self._clone_src[1])
+        h, w = self.source.shape[:2]
+        self.crop_bar.set_output_size(
+            round((rect["x1"] - rect["x0"]) * w),
+            round((rect["y1"] - rect["y0"]) * h))
+
+    def _clear_stamps(self) -> bool:
+        """几何变换后图章坐标无法重放，把已生效的修改并入源图并清空历史。"""
+        had = bool(self._clone_ops) or self._retouch_full is not None
+        self._clone_ops.clear()
+        self._retouch_full = None
+        self._retouch_preview = None
+        self._stamp_src_rect = None
+        self.preview.set_stamp_source(None)
+        return had
+
+    def _commit_geometry(self, new_source: np.ndarray):
+        """几何变换落地：重建各级缓存与预览（调整参数保留，蒙版已同步）。"""
+        self.source = np.ascontiguousarray(new_source)
+        self.preview_src = downscale_max_edge(self.source, PREVIEW_MAX_EDGE)
+        self.processor.set_source(PREVIEW, self.preview_src)
+        self.processor.set_source(FULL, self.source)
+        self.preview.set_full_size(self.source.shape[1], self.source.shape[0])
+        self.preview.zoom_fit()
+        self._overlay_cache.clear()
+        self._on_params_changed(force_full=True)
+        self._refresh_mask_overlays()
+        self._update_status()
+
+    def _apply_crop(self):
+        rect = self.preview.crop_rect()
+        if rect is None or self.source is None:
+            return
+        angle = self._crop_angle
+        rect_t = (rect["x0"], rect["y0"], rect["x1"], rect["y1"])
+        base = self._retouch_full if self._retouch_full is not None else self.source
+        if abs(angle) < 1e-9 and rect_t == (0.0, 0.0, 1.0, 1.0):
+            new_src = np.ascontiguousarray(base)
+            map_point = lambda nx, ny: (nx, ny)
+            new_shape = new_src.shape[:2]
+        else:
+            new_src, map_point, new_shape = core.crop_rotate(base, rect_t, angle)
+        core.remap_mask_geometry(self.params.masks, map_point,
+                                 base.shape[:2], new_shape, angle_delta=-angle)
+        baked = self._clear_stamps()
+        self.act_crop.setChecked(False)
+        self._close_crop_ui()
+        self._commit_geometry(new_src)
+        msg = "已应用裁剪" if abs(angle) < 1e-9 else f"已应用拉直（{angle:+.1f}°）与裁剪"
+        if baked:
+            msg += "；图章修改已一并合并"
+        self.statusBar().showMessage(msg, 5000)
+
+    def _rotate90(self, clockwise: bool):
+        if self.source is None:
+            QMessageBox.information(self, "旋转", "请先打开一幅图像。")
+            return
+        base = self._retouch_full if self._retouch_full is not None else self.source
+        k = 3 if clockwise else 1
+        new_src = core.rotate90(base, k)
+        core.remap_masks_rot90(self.params.masks, k, base.shape[:2])
+        self._clear_stamps()
+        self._commit_geometry(new_src)
+        self.statusBar().showMessage("已右转 90°" if clockwise else "已左转 90°", 2500)
+
+    def _stamp_feather_frac(self) -> float:
+        return float(np.clip(self._stamp_feather, 0.0, 100.0)) / 100.0
+
+    def _ensure_retouch(self):
+        """首次图章修改时创建工作副本（全图 + 预览）。"""
         if self._retouch_full is None:
             self._retouch_full = self.source.copy()
             self._retouch_preview = (self.preview_src.copy()
                                      if self.preview_src is not None else None)
-        self._stroke_dest.append((float(nx), float(ny)))
-        now = time.monotonic()
-        if now - self._last_stamp_time > 0.06:
-            self._last_stamp_time = now
-            self._apply_new_stamp_points(preview=True)
 
-    def _on_clone_finished(self):
-        if (not self._stroke_dest or self._clone_src is None
-                or self._clone_offset is None):
-            self._stroke_dest.clear()
+    def _on_stamp_feather(self, v: float):
+        self._stamp_feather = float(v)
+
+    def _on_stamp_new_source(self):
+        self._stamp_src_rect = None
+        self.preview.set_stamp_source(None)
+        self.statusBar().showMessage("请在图像上拖出新的源矩形", 4000)
+
+    def _on_clone_source(self, rect):
+        self._stamp_src_rect = tuple(rect)
+        self.preview.set_stamp_source(rect)
+        self.statusBar().showMessage(
+            "已选源区域：在目标处拖出矩形覆盖（Alt+拖动或「重选源区」可重选）", 5000)
+
+    def _on_clone_apply(self, rect):
+        if self.source is None:
             return
-        self._apply_new_stamp_points(preview=False)
-        self._clone_ops.append((self._clone_src, self._clone_offset,
-                                list(self._stroke_dest), self._clone_size))
-        self._stroke_dest.clear()
-        self._stroke_applied = 0
+        if self._stamp_src_rect is None:
+            self.statusBar().showMessage("请先在图像上拖出源矩形", 3000)
+            return
+        self._ensure_retouch()
+        feather = self._stamp_feather_frac()
+        src_r = self._stamp_src_rect
+        h, w = self._retouch_full.shape[:2]
+        core.copy_patch(self._retouch_full, core.norm_rect_px(src_r, h, w),
+                        core.norm_rect_px(rect, h, w), feather)
+        if self._retouch_preview is not None:
+            ph, pw = self._retouch_preview.shape[:2]
+            core.copy_patch(self._retouch_preview,
+                            core.norm_rect_px(src_r, ph, pw),
+                            core.norm_rect_px(rect, ph, pw), feather)
+        self._clone_ops.append((tuple(src_r), tuple(rect), float(self._stamp_feather)))
+        self.processor.set_source(PREVIEW, self._retouch_preview)
         self.processor.set_source(FULL, self._retouch_full)
+        self._submit(PREVIEW)          # 先给一帧降采样反馈，全图随后
         self._on_params_committed()
 
-    def _apply_new_stamp_points(self, preview: bool):
-        """把当前笔画中尚未落盘的点盖到全图/预览工作副本上。"""
-        new = self._stroke_dest[self._stroke_applied:]
-        if not new or self._retouch_full is None:
-            return
-        src, offset, size = self._clone_src, self._clone_offset, self._clone_size
-        h, w = self._retouch_full.shape[:2]
-        r = self._stamp_radius((h, w))
-        for nx, ny in new:
-            core.clone_stamp(self._retouch_full,
-                             ((nx - offset[0]) * w, (ny - offset[1]) * h),
-                             (nx * w, ny * h), r)
-        self._stroke_applied = len(self._stroke_dest)
-        if preview and self._retouch_preview is not None:
-            ph, pw = self._retouch_preview.shape[:2]
-            rp = max(1.0, size / 100.0 * min(ph, pw) * 0.5)
-            for nx, ny in new:
-                core.clone_stamp(self._retouch_preview,
-                                 ((nx - offset[0]) * pw, (ny - offset[1]) * ph),
-                                 (nx * pw, ny * ph), rp)
-            self.processor.set_source(PREVIEW, self._retouch_preview)
-            self._submit(PREVIEW)
-
     def _replay_stamps(self):
-        """由原始源图重放全部图章笔画（撤销/清除后调用）。"""
+        """由原始源图重放全部覆盖操作（撤销/清除后调用）。"""
         self._retouch_full = None
         self._retouch_preview = None
         if self._clone_ops and self.source is not None:
-            self._retouch_full = self.source.copy()
-            self._retouch_preview = (self.preview_src.copy()
-                                     if self.preview_src is not None else None)
-            for src, offset, dests, size in self._clone_ops:
+            self._ensure_retouch()
+            for src_r, dst_r, feather_pct in self._clone_ops:
+                fe = float(np.clip(feather_pct, 0.0, 100.0)) / 100.0
                 h, w = self._retouch_full.shape[:2]
-                r = max(1.0, size / 100.0 * min(h, w) * 0.5)
-                for nx, ny in dests:
-                    core.clone_stamp(self._retouch_full,
-                                     ((nx - offset[0]) * w, (ny - offset[1]) * h),
-                                     (nx * w, ny * h), r)
+                core.copy_patch(self._retouch_full,
+                                core.norm_rect_px(src_r, h, w),
+                                core.norm_rect_px(dst_r, h, w), fe)
                 if self._retouch_preview is not None:
                     ph, pw = self._retouch_preview.shape[:2]
-                    rp = max(1.0, size / 100.0 * min(ph, pw) * 0.5)
-                    for nx, ny in dests:
-                        core.clone_stamp(self._retouch_preview,
-                                         ((nx - offset[0]) * pw, (ny - offset[1]) * ph),
-                                         (nx * pw, ny * ph), rp)
+                    core.copy_patch(self._retouch_preview,
+                                    core.norm_rect_px(src_r, ph, pw),
+                                    core.norm_rect_px(dst_r, ph, pw), fe)
         self.processor.set_source(PREVIEW, self._retouch_preview
                                   if self._retouch_preview is not None else self.preview_src)
         self.processor.set_source(FULL, self._retouch_full
                                   if self._retouch_full is not None else self.source)
+        self._submit(PREVIEW)
         self._on_params_committed()
 
     def _on_stamp_undo(self):
@@ -1810,12 +2028,14 @@ class MainWindow(QMainWindow):
         overlays = []
         for i, m in enumerate(self.params.masks):
             key = (mask_cache_key(m, shape), i == self._mask_sel)
-            img = self._overlay_cache.get(key)
+            img = self._overlay_cache.pop(key, None)
             if img is None:
                 img = mask_to_qimage(render_mask(m, shape, max_edge=768),
                                      selected=(i == self._mask_sel))
-                self._overlay_cache[key] = img
+            self._overlay_cache[key] = img    # 重新插入以刷新“最近使用”顺序
             overlays.append(img)
+        while len(self._overlay_cache) > self._OVERLAY_CACHE_MAX:
+            del self._overlay_cache[next(iter(self._overlay_cache))]
         self.preview.set_overlays(overlays)
 
     # ------------------------------------------------------------ 对比
@@ -1847,5 +2067,27 @@ class MainWindow(QMainWindow):
             self.status_image.setText(f"{w} × {h} px   ·   蒙版编辑中：拖动编辑，Esc 退出")
 
     def closeEvent(self, event):
-        self.processor.stop()
+        self._full_timer.stop()
+        self.processor.stop()        # 协作取消：正在渲染的任务在分块之间尽快中止
         super().closeEvent(event)
+
+    # ------------------------------------------------------------ 拖放打开图像
+    @staticmethod
+    def _is_loadable_url(url) -> bool:
+        if not url.isLocalFile():
+            return False
+        ext = os.path.splitext(url.toLocalFile())[1].lower()
+        return ext in (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp") \
+            or ext in RAW_EXTENSIONS
+
+    def dragEnterEvent(self, event):
+        md = event.mimeData()
+        if md.hasUrls() and any(self._is_loadable_url(u) for u in md.urls()):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        for u in event.mimeData().urls():
+            if self._is_loadable_url(u):
+                self.load_image(u.toLocalFile())
+                event.acceptProposedAction()
+                return

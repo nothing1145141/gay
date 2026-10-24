@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import os
 import re
+import time
 import urllib.request
 
 import numpy as np
@@ -40,6 +42,12 @@ _SCALAR_FIELDS = {
 
 def _clamp(v, lo, hi) -> float:
     return float(max(lo, min(hi, float(v))))
+
+
+def _finite(v) -> bool:
+    """数值字段可用性：json.loads 会接受 NaN/Infinity 字面量，必须显式排除。"""
+    return isinstance(v, (int, float)) and not isinstance(v, bool) \
+        and math.isfinite(float(v))
 
 
 # ======================================================================
@@ -117,6 +125,7 @@ _PREFERRED_MODEL = "deepseek-v4-flash-vision-exp"
 _VISION_HINT = re.compile(r"vision|minicpm-v|vl-|\dv|qvq|internvl", re.I)
 _ZCODE_PROVIDERS = os.path.expanduser("~/.zcode/v2/provider_config.json")
 _candidates_cache: list | None = None
+_candidates_time: float = 0.0
 
 
 def _model_sort_key(model: str) -> tuple:
@@ -130,22 +139,27 @@ def _model_sort_key(model: str) -> tuple:
     return (3, m)
 
 
-_models_cache: dict = {}      # baseUrl -> 模型 id 列表
+_models_cache: dict = {}      # baseUrl -> (时间戳, 模型 id 列表)
+_MODELS_TTL = 120.0           # 失败结果只短时缓存，避免瞬时网络故障被永久记住
 
 
 def _fetch_models(base: str, key: str) -> list:
-    """GET {base}/models（OpenAI 兼容），失败返回空列表。"""
-    if base not in _models_cache:
-        try:
-            req = urllib.request.Request(
-                base + "/models", headers={"Authorization": "Bearer " + key})
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                data = json.loads(resp.read())
-            _models_cache[base] = [m.get("id", "") for m in data.get("data", [])
-                                   if m.get("id")]
-        except Exception:
-            _models_cache[base] = []
-    return _models_cache[base]
+    """GET {base}/models（OpenAI 兼容）；成功会话内缓存，失败仅短时缓存后重试。"""
+    ent = _models_cache.get(base)
+    now = time.monotonic()
+    if ent is not None and (ent[1] or now - ent[0] < _MODELS_TTL):
+        return ent[1]
+    models: list = []
+    try:
+        req = urllib.request.Request(
+            base + "/models", headers={"Authorization": "Bearer " + key})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read())
+        models = [m.get("id", "") for m in data.get("data", []) if m.get("id")]
+    except Exception:
+        pass
+    _models_cache[base] = (now, models)
+    return models
 
 
 def _zcode_candidates() -> list:
@@ -179,9 +193,16 @@ def _zcode_candidates() -> list:
 
 
 def resolve_candidates() -> list:
-    """返回按优先级排序的 (baseUrl, apiKey, model) 候选列表。"""
-    global _candidates_cache
-    if _candidates_cache is not None:
+    """返回按优先级排序的 (baseUrl, apiKey, model) 候选列表。
+
+    非空结果会话内缓存；空结果只缓存 _CANDIDATES_TTL 秒——一次瞬时网络
+    故障不应让 AI 功能在整个会话内不可用。
+    """
+    global _candidates_cache, _candidates_time
+    if _candidates_cache:
+        return _candidates_cache
+    if _candidates_cache is not None and \
+            time.monotonic() - _candidates_time < _MODELS_TTL:
         return _candidates_cache
     out = []
     base = os.environ.get("PHOTOLAB_AI_BASE_URL", "").rstrip("/")
@@ -191,6 +212,7 @@ def resolve_candidates() -> list:
         out.append((base, key, model))            # 显式配置唯一优先
     out.extend(sorted(set(_zcode_candidates()), key=lambda c: _model_sort_key(c[2])))
     _candidates_cache = out
+    _candidates_time = time.monotonic()
     return out
 
 
@@ -211,7 +233,7 @@ def sanitize_ai_params(data: dict) -> dict:
         return {}
     out: dict = {}
     for name, (lo, hi) in _SCALAR_FIELDS.items():
-        if name in data and isinstance(data[name], (int, float)):
+        if name in data and _finite(data[name]):
             v = _clamp(data[name], lo, hi)
             if abs(v) > 0.4:
                 out[name] = round(v, 2)
@@ -242,10 +264,13 @@ def sanitize_ai_params(data: dict) -> dict:
             w = wheels.get(name)
             if not isinstance(w, dict):
                 continue
+            raw = (w.get("hue", 0), w.get("saturation", 0), w.get("luminance", 0))
+            if not all(_finite(v) for v in raw):     # NaN/Infinity 直接丢弃
+                continue
             try:
-                sat = _clamp(w.get("saturation", 0), -100, 100)
-                lum_v = _clamp(w.get("luminance", 0), -100, 100)
-                hue = float(w.get("hue", 0)) % 360.0
+                sat = _clamp(raw[1], -100, 100)
+                lum_v = _clamp(raw[2], -100, 100)
+                hue = float(raw[0]) % 360.0
             except Exception:
                 continue
             if abs(sat) > 0.4 or abs(lum_v) > 0.4:
@@ -260,12 +285,16 @@ def sanitize_ai_params(data: dict) -> dict:
         for p in pickers[:4]:
             if not isinstance(p, dict):
                 continue
+            raw = (p.get("hue", 0), p.get("span", 30), p.get("hue_shift", 0),
+                   p.get("saturation", 0), p.get("luminance", 0))
+            if not all(_finite(v) for v in raw):     # NaN/Infinity 直接丢弃
+                continue
             try:
-                hue = float(p.get("hue", 0)) % 360.0
-                span = _clamp(p.get("span", 30), 5, 180)
-                shift = _clamp(p.get("hue_shift", 0), -60, 60)
-                sat = _clamp(p.get("saturation", 0), -100, 100)
-                lum_v = _clamp(p.get("luminance", 0), -100, 100)
+                hue = float(raw[0]) % 360.0
+                span = _clamp(raw[1], 5, 180)
+                shift = _clamp(raw[2], -60, 60)
+                sat = _clamp(raw[3], -100, 100)
+                lum_v = _clamp(raw[4], -100, 100)
             except Exception:
                 continue
             if abs(shift) > 0.4 or abs(sat) > 0.4 or abs(lum_v) > 0.4:
@@ -349,7 +378,12 @@ def suggest_ai(rgb8: np.ndarray, timeout: int = 90) -> tuple:
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 data = json.loads(resp.read())
-            text = data["choices"][0]["message"]["content"] or ""
+            content = data["choices"][0]["message"]["content"]
+            if isinstance(content, list):
+                # 部分实现把 content 拆成多段（{"type": "text", "text": ...}）
+                content = "".join(part.get("text", "")
+                                  for part in content if isinstance(part, dict))
+            text = str(content or "")
             raw = _extract_json(text)
             note = str(raw.get("note", "")).strip()[:100]
             params = sanitize_ai_params(raw)

@@ -259,7 +259,7 @@ def _run(st, params, lin: np.ndarray) -> np.ndarray:
         f32(params.blacks / 100.0 * 0.09),
         f32(1.0 + params.saturation / 100.0),
         f32(params.vibrance / 100.0),
-        f32(params.blackwhite / 100.0),
+        f32(np.clip(params.blackwhite / 100.0, 0.0, 1.0)),   # 与 CPU 一致饱和到 [0,1]
     ]
 
     # ---- 缓冲区（按像素数复用）----

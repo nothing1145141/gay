@@ -27,5 +27,5 @@ for %%p in (rawpy pyopencl) do (
         .venv\Scripts\python -m pip install --quiet --disable-pip-version-check %%p >nul 2>&1 || echo 可选依赖 %%p 安装失败，已跳过
     )
 )
-.venv\Scripts\python main.py
+.venv\Scripts\python main.py %*
 if errorlevel 1 pause

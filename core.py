@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import colorsys
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
@@ -949,11 +950,15 @@ def apply_effects(img: np.ndarray, params, low: np.ndarray | None = None,
 
 
 class LowResRenderer:
-    """清晰度所需的低频图：整幅图只算一次，再按行区间切片（分块安全、无接缝）。"""
+    """清晰度所需的低频图：整幅图只算一次，再按行区间切片（分块安全、无接缝）。
 
-    def __init__(self, lin: np.ndarray, params, edge: int = 512):
+    clarity_needed 应在整图级别判断：全局清晰度或任一蒙版局部清晰度非零都要创建，
+    否则蒙版内的清晰度会按分块自身算低频图，产生分块间差异。
+    """
+
+    def __init__(self, lin: np.ndarray, clarity_needed: bool, edge: int = 512):
         self.low = None
-        if not params.clarity:
+        if not clarity_needed:
             return
         h, w = lin.shape[:2]
         s = max(1, max(h, w) // edge)
@@ -972,12 +977,13 @@ class GlobalStats:
     """一次作业内复用的全局统计（去朦胧的大气光与暗通道平滑半径）。
 
     两者都必须按整幅图的尺寸计算：分块若各自统计会产生横向接缝与整体差异。
+    dehaze_needed 同样要覆盖蒙版局部的去朦胧（见 LowResRenderer）。
     """
 
-    def __init__(self, lin: np.ndarray, params):
+    def __init__(self, lin: np.ndarray, dehaze_needed: bool):
         self.A = None
         self.sigma = 1.0
-        if not params.dehaze:
+        if not dehaze_needed:
             return
         h, w = lin.shape[:2]
         self.sigma = max(1.0, min(h, w) / 240.0)
@@ -1121,6 +1127,7 @@ class MaskRenderer:
         h, w = shape
         self._full: list = []
         self._coarse: list = []
+        self._lock = threading.Lock()   # 并行分块首用时只做一次上采样
         for m in masks:
             if m.is_trivial():
                 self._coarse.append(None)
@@ -1137,15 +1144,17 @@ class MaskRenderer:
     def get(self, index: int, y0: int, y1: int, width: int) -> np.ndarray:
         """原图行区间 [y0, y1) 对应的蒙版。"""
         if self._full[index] is None:
-            coarse = self._coarse[index]
-            if coarse is None:
-                coarse = render_mask(self.masks[index], (y1 - y0, width))
-                self._full[index] = coarse
-            else:
-                h, w = self.shape
-                self._full[index] = cv2.resize(coarse, (w, h),
-                                               interpolation=cv2.INTER_LINEAR)
-                self._coarse[index] = None      # 释放低分辨率副本
+            with self._lock:
+                if self._full[index] is None:   # 双重检查：并行时只上采样一次
+                    coarse = self._coarse[index]
+                    if coarse is None:
+                        coarse = render_mask(self.masks[index], (y1 - y0, width))
+                        self._full[index] = coarse
+                    else:
+                        h, w = self.shape
+                        self._full[index] = cv2.resize(coarse, (w, h),
+                                                       interpolation=cv2.INTER_LINEAR)
+                        self._coarse[index] = None      # 释放低分辨率副本
         mask = self._full[index]
         return mask[y0:y1] if mask.shape[0] > (y1 - y0) else \
             cv2.resize(mask, (width, y1 - y0), interpolation=cv2.INTER_LINEAR)
@@ -1197,60 +1206,266 @@ def apply_masked_adjustments(img: np.ndarray, masks, renderer: "MaskRenderer | N
     return out
 
 
+def _mask_effect_strengths(params) -> dict:
+    """效果强度的整图级记账：全局与所有蒙版局部取最大（分块/halo 依据）。"""
+    masks = getattr(params, "masks", [])
+    out = {f: abs(float(getattr(params, f, 0.0)))
+           for f in EFFECT_FIELDS}
+    for m in masks:
+        for f in EFFECT_FIELDS:
+            out[f] = max(out[f], abs(float(getattr(m.adj, f, 0.0))))
+    return out
+
+
 def mask_halo(params, h: int, w: int) -> int:
     """分块时所需的重叠像素：效果算子的模糊需要邻域。
 
-    清晰度/锐度/去朦胧取 64；降噪按双边滤波半径（≈2σ）另计，二者取大。
+    全局与蒙版局部效果一并计入：清晰度/锐度取 64；去朦胧的暗通道高斯
+    实际半径为 4σ（σ = 短边/240），大图时超过 64，按 4σ+1 动态计算；
+    降噪按双边滤波半径（≈2σ）另计，三者取大。
     蒙版由 MaskRenderer 在低分辨率全局渲染，不产生接缝，因此不需要 halo。
     """
-    halo = 64 if (params.clarity or params.sharpen or params.dehaze) else 0
-    if getattr(params, "denoise", 0):
-        halo = max(halo, int(_denoise_sigmas(params.denoise)[1] * 2.0) + 6)
+    eff = _mask_effect_strengths(params)
+    halo = 0
+    if eff["clarity"] or eff["sharpen"] or eff["dehaze"]:
+        halo = 64
+    if eff["dehaze"]:
+        sigma = max(1.0, min(h, w) / 240.0)
+        halo = max(halo, int(4.0 * sigma) + 1)
+    if eff["denoise"]:
+        halo = max(halo, int(_denoise_sigmas(eff["denoise"])[1] * 2.0) + 6)
     return halo
 
 
 # ======================================================================
-# 8b. 仿制图章（像素级内容修改，在流水线之前作用于源图）
+# 8b. 仿制图章（矩形取样覆盖，在流水线之前作用于源图）
 # ======================================================================
 
 
-def _disc_alpha(radius: int, feather: float = 0.45) -> np.ndarray:
-    """圆形羽化 alpha 盘 (2r+1, 2r+1)：1 = 完全复制，边缘 smoothstep 到 0。"""
-    r = max(int(radius), 1)
-    yy, xx = np.mgrid[-r:r + 1, -r:r + 1].astype(np.float32)
-    d = np.sqrt(xx * xx + yy * yy) / np.float32(r)
-    a = np.float32(1.0) - smoothstep(np.float32(1.0 - feather), np.float32(1.0), d)
-    return a.astype(np.float32)
+def copy_patch(img: np.ndarray, src_rect, dst_rect, feather: float = 0.2) -> None:
+    """矩形取样覆盖：把源矩形内容缩放到目标矩形尺寸后羽化覆盖（原地修改）。
 
-
-def clone_stamp(img: np.ndarray, src_px, dst_px, radius: float,
-                feather: float = 0.45) -> None:
-    """仿制图章：把以 src_px 为中心的圆形区域羽化复制到 dst_px（原地修改）。
-
-    坐标为像素 (x, y)；radius 为像素半径。以目标窗口为基准求三重交集
-    （图像范围 × 源窗口范围 × 目标窗口范围），源/目标重叠时先取快照再混合，
-    越界部分自动裁剪。
+    src_rect / dst_rect 为像素 (x0, y0, x1, y1)，越界部分自动裁剪；
+    feather ∈ [0,1] 为边缘羽化宽度（相对目标短边的一半，上限 64px）。
+    先把源区域 resize 成独立数组再混合，源/目标重叠安全。
     """
     h, w = img.shape[:2]
-    r = max(1, int(round(radius)))
-    alpha = _disc_alpha(r, feather)
-    sx, sy = int(round(src_px[0])), int(round(src_px[1]))
-    dx, dy = int(round(dst_px[0])), int(round(dst_px[1]))
-    oy, ox = sy - dy, sx - dx                     # 目标像素 -> 源像素偏移
-    dy0, dx0 = dy - r, dx - r
-    y0 = max(dy0, 0, -oy)
-    y1 = min(dy0 + 2 * r + 1, h, h - oy)
-    x0 = max(dx0, 0, -ox)
-    x1 = min(dx0 + 2 * r + 1, w, w - ox)
-    if y0 >= y1 or x0 >= x1:
-        return
-    a = alpha[y0 - dy0:y1 - dy0, x0 - dx0:x1 - dx0][..., None]
-    patch = img[y0 + oy:y1 + oy, x0 + ox:x1 + ox].astype(np.float32)  # 先快照
-    dst = img[y0:y1, x0:x1]
+
+    def clamp_rect(r):
+        x0, x1 = sorted((float(r[0]), float(r[2])))
+        y0, y1 = sorted((float(r[1]), float(r[3])))
+        ix0 = int(round(max(0.0, x0)))
+        iy0 = int(round(max(0.0, y0)))
+        ix1 = int(round(min(float(w), x1)))
+        iy1 = int(round(min(float(h), y1)))
+        return ix0, iy0, max(ix0 + 2, ix1), max(iy0 + 2, iy1)
+
+    sx0, sy0, sx1, sy1 = clamp_rect(src_rect)
+    dx0, dy0, dx1, dy1 = clamp_rect(dst_rect)
+    dw, dh = dx1 - dx0, dy1 - dy0
+    patch = cv2.resize(img[sy0:sy1, sx0:sx1], (dw, dh),
+                       interpolation=cv2.INTER_LINEAR)
+
+    fpx = min(float(np.clip(feather, 0.0, 1.0)) * min(dw, dh) * 0.5, 64.0)
+
+    def ramp(n: int) -> np.ndarray:
+        """沿一维的边缘羽化：边缘 0 -> 内部精确 1（smoothstep 过渡）。"""
+        if fpx <= 0.5:
+            return np.ones(n, np.float32)
+        t = np.minimum(np.arange(n, dtype=np.float32),
+                       np.arange(n - 1, -1, -1, dtype=np.float32))
+        return smoothstep(np.float32(0.0), np.float32(fpx), t + np.float32(0.5))
+
+    alpha = ramp(dh)[:, None] * ramp(dw)[None, :]
+
+    dst = img[dy0:dy1, dx0:dx1]
     blended = dst.astype(np.float32)
-    blended *= (np.float32(1.0) - a)
-    blended += patch * a
+    blended *= (np.float32(1.0) - alpha[..., None])
+    blended += patch.astype(np.float32) * alpha[..., None]
     dst[...] = np.clip(blended + np.float32(0.5), 0, 255).astype(np.uint8)
+
+
+def norm_rect_px(rect_norm, h: int, w: int) -> tuple:
+    """归一化矩形 (x0,y0,x1,y1) -> 像素矩形（按高 h、宽 w 换算）。"""
+    return (rect_norm[0] * w, rect_norm[1] * h,
+            rect_norm[2] * w, rect_norm[3] * h)
+
+
+# ======================================================================
+# 8c. 几何变换（裁剪 / 旋转 / 拉直）——与图章一样在流水线之前作用于源图
+# ======================================================================
+
+
+def rotate90(rgb: np.ndarray, quarter_turns: int = 1) -> np.ndarray:
+    """旋转 90° 的整数倍（quarter_turns>0 为逆时针，与 np.rot90 一致），无损。"""
+    return np.ascontiguousarray(np.rot90(rgb, quarter_turns))
+
+
+def rotation_matrix(shape, angle_deg: float) -> np.ndarray:
+    """绕图像中心的旋转矩阵（2x3，旧像素坐标 -> 新像素坐标，OpenCV 约定）。"""
+    h, w = shape[:2]
+    return cv2.getRotationMatrix2D((w / 2.0, h / 2.0), float(angle_deg), 1.0)
+
+
+def rotate_image(rgb: np.ndarray, angle_deg: float,
+                 interpolation: int = cv2.INTER_LINEAR):
+    """绕中心旋转 angle_deg 度（OpenCV 约定：正值逆时针），画布尺寸不变。
+
+    返回 (旋转结果, M)；M 为 2x3 仿射矩阵，把旧像素坐标映射到新坐标，
+    供蒙版坐标同步换算（见 remap_mask_geometry）。旋转后画布四角可能落在
+    原图之外，调用方应把裁剪框约束在有效区内（见 fit_rect_in_rotation）。
+    """
+    m = rotation_matrix(rgb.shape, angle_deg)
+    out = cv2.warpAffine(rgb, m, (rgb.shape[1], rgb.shape[0]),
+                         flags=interpolation, borderMode=cv2.BORDER_REPLICATE)
+    return out, m
+
+
+def _rect_corners_inside_rotation(rect, shape, angle_deg: float) -> bool:
+    """矩形（像素 x0,y0,x1,y1）的四角是否全部落在旋转后的原图有效区内。"""
+    x0, y0, x1, y1 = rect
+    h, w = shape[:2]
+    t = float(np.radians(angle_deg))
+    ca, sa = float(np.cos(t)), float(np.sin(t))
+    cx, cy = w / 2.0, h / 2.0
+    for x, y in ((x0, y0), (x1, y0), (x0, y1), (x1, y1)):
+        dx, dy = x - cx, y - cy
+        ux = ca * dx + sa * dy          # 逆旋转回原图坐标
+        uy = -sa * dx + ca * dy
+        if abs(ux) > w / 2.0 + 1e-6 or abs(uy) > h / 2.0 + 1e-6:
+            return False
+    return True
+
+
+def fit_rect_in_rotation(rect, shape, angle_deg: float,
+                         min_px: int = 16) -> tuple:
+    """把像素矩形向中心收缩，直到完全位于旋转 angle_deg 后的有效区内。
+
+    θ=0 时只做画布边界裁剪；否则二分收缩比例（对任意角度/宽高比稳健，
+    避免内接矩闭式解的分段讨论）。返回 (x0, y0, x1, y1) 像素坐标。
+    """
+    w, h = shape[1], shape[0]
+    x0, y0, x1, y1 = (max(0.0, min(rect[0], w)), max(0.0, min(rect[1], h)),
+                      min(float(w), max(rect[2], 0.0)), min(float(h), max(rect[3], 0.0)))
+    x0, x1 = min(x0, x1), max(x0, x1)
+    y0, y1 = min(y0, y1), max(y0, y1)
+    if abs(angle_deg) < 1e-9:
+        return (int(round(x0)), int(round(y0)), int(round(x1)), int(round(y1)))
+
+    def scaled(k: float) -> tuple:
+        cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+        hw, hh = (x1 - x0) / 2.0 * k, (y1 - y0) / 2.0 * k
+        return (cx - hw, cy - hh, cx + hw, cy + hh)
+
+    if _rect_corners_inside_rotation((x0, y0, x1, y1), shape, angle_deg):
+        best = (x0, y0, x1, y1)
+    else:
+        lo, hi = 0.0, 1.0            # 收缩比例的下/上界
+        best = scaled(lo)
+        for _ in range(28):          # 二分 ~1e-8
+            mid = (lo + hi) / 2.0
+            r = scaled(mid)
+            if _rect_corners_inside_rotation(r, shape, angle_deg):
+                lo, best = mid, r
+            else:
+                hi = mid
+    # 保证最小尺寸、取整；取整可能把边缘放大零点几像素，再向内收缩到有效区
+    cx, cy = (best[0] + best[2]) / 2.0, (best[1] + best[3]) / 2.0
+    hw = max((best[2] - best[0]) / 2.0, min_px / 2.0)
+    hh = max((best[3] - best[1]) / 2.0, min_px / 2.0)
+    ix0, iy0 = int(round(cx - hw)), int(round(cy - hh))
+    ix1, iy1 = int(round(cx + hw)), int(round(cy + hh))
+    while ix1 - ix0 > 4 and iy1 - iy0 > 4 and not _rect_corners_inside_rotation(
+            (ix0, iy0, ix1, iy1), shape, angle_deg):
+        ix0 += 1
+        iy0 += 1
+        ix1 -= 1
+        iy1 -= 1
+    return (max(0, ix0), max(0, iy0), min(w, ix1), min(h, iy1))
+
+
+def remap_mask_geometry(masks, map_point, old_shape, new_shape,
+                        angle_delta: float = 0.0) -> None:
+    """几何变换后同步蒙版坐标（原地修改蒙版列表）。
+
+    map_point: (nx, ny) -> (nx', ny')，旧图归一化坐标 -> 新图归一化坐标；
+    径向蒙版角度加 angle_delta（屏幕顺时针为正，与 MaskState.angle 同约定；
+    刚体变换下椭圆主轴长度不变，故 aspect 无需改动）；
+    半径 / 笔刷大小按两图短边像素比缩放，保持物理尺寸不变。
+    """
+    short_old = min(old_shape[0], old_shape[1])
+    short_new = max(min(new_shape[0], new_shape[1]), 1)
+    ratio = short_old / short_new
+    for m in masks:
+        if m.kind == "linear":
+            m.x1, m.y1 = map_point(m.x1, m.y1)
+            m.x2, m.y2 = map_point(m.x2, m.y2)
+        elif m.kind == "radial":
+            m.cx, m.cy = map_point(m.cx, m.cy)
+            m.radius = float(np.clip(m.radius * ratio, 0.01, 5.0))
+            m.angle = (float(m.angle) + angle_delta) % 360.0
+        else:
+            m.strokes = [[tuple(map_point(x, y)) for x, y in s]
+                         for s in m.strokes]
+            m.size = float(np.clip(m.size * ratio, 1.0, 100.0))
+
+
+def remap_masks_rot90(masks, quarter_turns: int, old_shape) -> tuple:
+    """rotate90 之后同步蒙版，返回新图像形状。
+
+    旋转是刚体变换：椭圆主轴长度不变（aspect 不变），半径按短边比缩放，
+    角度随内容旋转（屏幕顺时针为正：逆时针旋转取负）。
+    """
+    k = quarter_turns % 4
+    oh, ow = old_shape[:2]
+    new_shape = (ow, oh) if k % 2 else (oh, ow)
+    if k == 0:
+        return new_shape
+    if k == 1:            # 逆时针：nx' = ny, ny' = 1-nx
+        f = lambda nx, ny: (ny, 1.0 - nx)
+        delta = -90.0
+    elif k == 3:          # 顺时针
+        f = lambda nx, ny: (1.0 - ny, nx)
+        delta = 90.0
+    else:                 # 180°
+        f = lambda nx, ny: (1.0 - nx, 1.0 - ny)
+        delta = 180.0
+    remap_mask_geometry(masks, f, old_shape, new_shape, angle_delta=delta)
+    return new_shape
+
+
+def crop_rotate(rgb: np.ndarray, rect_norm, angle_deg: float = 0.0,
+                interpolation: int = cv2.INTER_LINEAR):
+    """按裁剪框裁剪（可先绕中心旋转拉直），返回 (结果, map_point, 新形状)。
+
+    rect_norm 为 (x0, y0, x1, y1) 归一化坐标，定义在**旋转后的视图**里
+    （拉直时预览所见的坐标系）。map_point 把原图归一化坐标映射到结果
+    归一化坐标，供 remap_mask_geometry 同步蒙版。
+    """
+    h, w = rgb.shape[:2]
+    if abs(angle_deg) > 1e-9:
+        rotated, m = rotate_image(rgb, angle_deg, interpolation)
+    else:
+        rotated, m = rgb, None
+    x0 = int(round(float(np.clip(rect_norm[0], 0.0, 1.0)) * w))
+    y0 = int(round(float(np.clip(rect_norm[1], 0.0, 1.0)) * h))
+    x1 = int(round(float(np.clip(rect_norm[2], 0.0, 1.0)) * w))
+    y1 = int(round(float(np.clip(rect_norm[3], 0.0, 1.0)) * h))
+    x0, x1 = sorted((x0, x1)); y0, y1 = sorted((y0, y1))
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(w, x1), min(h, y1)
+    out = np.ascontiguousarray(rotated[y0:y1, x0:x1])
+    nw, nh = max(x1 - x0, 1), max(y1 - y0, 1)
+
+    def map_point(nx: float, ny: float):
+        px, py = nx * w, ny * h
+        if m is not None:
+            ox, oy = px, py
+            px = float(m[0, 0]) * ox + float(m[0, 1]) * oy + float(m[0, 2])
+            py = float(m[1, 0]) * ox + float(m[1, 1]) * oy + float(m[1, 2])
+        return ((px - x0) / nw, (py - y0) / nh)
+
+    return out, map_point, out.shape[:2]
 
 
 # ======================================================================
@@ -1287,16 +1502,22 @@ PARALLEL_MIN_PIXELS = 600_000
 _MAX_WORKERS = max(1, min(32, os.cpu_count() or 1))
 
 _EXECUTOR: ThreadPoolExecutor | None = None
+_EXECUTOR_LOCK = threading.Lock()
 
 # 环境变量 PHOTOLAB_NO_GPU=1 强制关闭 GPU 路径
 _GPU_ENABLED = os.environ.get("PHOTOLAB_NO_GPU", "") != "1"
+
+# 进入并行渲染前记录 OpenCV 默认线程数，结束后恢复（setNumThreads 是进程级全局设置）
+_CV2_DEFAULT_THREADS = cv2.getNumThreads()
 
 
 def _executor() -> ThreadPoolExecutor:
     global _EXECUTOR
     if _EXECUTOR is None:
-        _EXECUTOR = ThreadPoolExecutor(max_workers=_MAX_WORKERS,
-                                       thread_name_prefix="photolab")
+        with _EXECUTOR_LOCK:
+            if _EXECUTOR is None:
+                _EXECUTOR = ThreadPoolExecutor(max_workers=_MAX_WORKERS,
+                                               thread_name_prefix="photolab")
     return _EXECUTOR
 
 
@@ -1372,23 +1593,38 @@ def _process_rows(params, lin: np.ndarray, y0: int, y1: int, pad: int,
     out = apply_pickers(out, params.pickers)                          # 6. 取色器
     if params.blackwhite:                                            # 7. 黑白
         out = apply_blackwhite(out, params.blackwhite)
+    if out is lin or out.base is lin:
+        # 全链恒等时 out 仍是 lin（或其切片视图），裁剪不能写进输入缓存
+        out = out.copy()
     np.clip(out, 0.0, 1.0, out=out)
     result = linear_to_rgb8(out)
     return result[y0 - a:result.shape[0] - (b - y1)]
 
 
+class CancelledError(RuntimeError):
+    """渲染被协作取消（如窗口关闭时停止后台线程）；调用方应静默丢弃结果。"""
+
+
 def _process_band(params, lin: np.ndarray) -> np.ndarray:
     """整幅图的完整流水线（单线程路径，pad=0）。"""
+    eff = _mask_effect_strengths(params)
     renderer = MaskRenderer(params.masks, lin.shape[:2]) if params.masks else None
-    low_res = LowResRenderer(lin, params) if params.clarity else None
-    stats = GlobalStats(lin, params) if params.dehaze else None
+    low_res = LowResRenderer(lin, bool(eff["clarity"]))
+    stats = GlobalStats(lin, bool(eff["dehaze"]))
     return _process_rows(params, lin, 0, lin.shape[0], 0, renderer, low_res, stats)
 
 
-def process_linear(params, lin: np.ndarray) -> np.ndarray:
-    """线性光图像 -> 处理后的 uint8 sRGB RGB 图。"""
+def process_linear(params, lin: np.ndarray, should_cancel=None) -> np.ndarray:
+    """线性光图像 -> 处理后的 uint8 sRGB RGB 图。
+
+    should_cancel 为可选回调：返回 True 时尽快抛出 CancelledError 中止渲染
+    （在分块之间检查；GPU 内核与单个分块内部不可中断）。
+    """
     if params.is_default():
         return linear_to_rgb8(lin)
+
+    if should_cancel is not None and should_cancel():
+        raise CancelledError("已取消")
 
     if _GPU_ENABLED and _gpu_eligible(params):
         out = _try_gpu(params, lin)
@@ -1402,28 +1638,41 @@ def process_linear(params, lin: np.ndarray) -> np.ndarray:
         workers = _MAX_WORKERS
     parallel = workers > 1 and h > 2 * pad
 
-    # 自己按行分块并行时，限制 OpenCV 内部线程，避免 8x16 线程互相争抢
-    cv2.setNumThreads(1 if parallel else 0)
+    # 自己按行分块并行时，限制 OpenCV 内部线程，避免 8x16 线程互相争抢；
+    # 渲染结束后恢复默认值，避免影响 GUI 线程的解码/缩放等 cv2 调用
+    if parallel:
+        cv2.setNumThreads(1)
+    try:
+        if not parallel:
+            if should_cancel is not None and should_cancel():
+                raise CancelledError("已取消")
+            return _process_band(params, lin)
 
-    if not parallel:
-        return _process_band(params, lin)
+        eff = _mask_effect_strengths(params)
+        out = np.empty(lin.shape, dtype=np.uint8)
+        bounds = np.linspace(0, h, workers + 1).astype(int)
+        renderer = MaskRenderer(params.masks, (h, w)) if params.masks else None
+        low_res = LowResRenderer(lin, bool(eff["clarity"]))
+        stats = GlobalStats(lin, bool(eff["dehaze"]))
 
-    out = np.empty(lin.shape, dtype=np.uint8)
-    bounds = np.linspace(0, h, workers + 1).astype(int)
-    renderer = MaskRenderer(params.masks, (h, w)) if params.masks else None
-    low_res = LowResRenderer(lin, params) if params.clarity else None
-    stats = GlobalStats(lin, params) if params.dehaze else None
+        def work(i: int):
+            if should_cancel is not None and should_cancel():
+                raise CancelledError("已取消")
+            y0, y1 = int(bounds[i]), int(bounds[i + 1])
+            if y1 <= y0:
+                return
+            out[y0:y1] = _process_rows(params, lin, y0, y1, pad, renderer,
+                                       low_res, stats)
 
-    def work(i: int):
-        y0, y1 = int(bounds[i]), int(bounds[i + 1])
-        if y1 <= y0:
-            return
-        out[y0:y1] = _process_rows(params, lin, y0, y1, pad, renderer, low_res, stats)
+        list(_executor().map(work, range(workers)))
+        if should_cancel is not None and should_cancel():
+            raise CancelledError("已取消")
+        return out
+    finally:
+        if parallel:
+            cv2.setNumThreads(_CV2_DEFAULT_THREADS)
 
-    list(_executor().map(work, range(workers)))
-    return out
 
-
-def process(params, rgb8: np.ndarray) -> np.ndarray:
+def process(params, rgb8: np.ndarray, should_cancel=None) -> np.ndarray:
     """uint8 sRGB RGB -> 处理后的 uint8 sRGB RGB。"""
-    return process_linear(params, rgb8_to_linear(rgb8))
+    return process_linear(params, rgb8_to_linear(rgb8), should_cancel)

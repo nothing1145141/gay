@@ -341,6 +341,12 @@ def test_ai_sanitize():
     check("AI 解析:空输入安全", auto.sanitize_ai_params(None) == {}
           and auto.sanitize_ai_params("bad") == {})
 
+    # json.loads 默认接受 NaN/Infinity 字面量，必须全部被钳制层丢弃
+    nan_case = {"exposure": float("nan"), "contrast": float("inf"),
+                "wheels": {"shadows": {"hue": float("nan"), "saturation": 30}},
+                "pickers": [{"hue": float("inf"), "span": 30, "saturation": -40}]}
+    check("AI 解析:NaN/Infinity 全部被丢弃", auto.sanitize_ai_params(nan_case) == {})
+
 
 def test_gpu_matches_cpu():
     """有 OpenCL GPU 时，GPU 结果必须与 CPU 接近（浮点实现允许微小舍入差）。"""
@@ -416,22 +422,35 @@ def test_mask_advanced():
     check("含曲线蒙版使流水线生效", not p.is_default())
 
 
-def test_clone_stamp():
+def test_patch_copy():
+    """矩形取样覆盖：内容复制、缩放、羽化、越界与源目标重叠安全。"""
     img = np.zeros((64, 64, 3), np.uint8)
     img[:, :32] = 200
-    core.clone_stamp(img, (8, 32), (48, 32), 6)
-    check("图章复制源区域内容", img[32, 48, 0] == 200)
-    check("图章不影响远处", img[2, 60, 0] == 0)
-    check("图章边缘羽化过渡", 0 < img[32, 53, 0] < 200)
+    core.copy_patch(img, (4, 4, 28, 28), (36, 36, 60, 60), 0.0)
+    check("矩形取样复制内容", img[48, 48, 0] == 200)
+    check("目标外不受影响", img[2, 60, 0] == 0)
+    check("无羽化时目标边角完全覆盖",
+          img[36, 36, 0] == 200 and img[59, 59, 0] == 200)
 
-    img2 = np.full((32, 32, 3), 128, np.uint8)
-    core.clone_stamp(img2, (16, 16), (20, 16), 8)
-    check("源/目标重叠安全", bool(np.all(np.isfinite(img2))) and float(img2.mean()) > 0)
+    img2 = np.zeros((50, 50, 3), np.uint8)
+    img2[10:30, 10:30] = 255                       # 大源块
+    core.copy_patch(img2, (10, 10, 30, 30), (5, 5, 15, 15), 0.0)   # 缩小覆盖
+    check("覆盖自动缩放到目标尺寸", img2[6, 6, 0] == 255 and img2[14, 14, 0] == 255)
 
-    img3 = np.zeros((40, 40, 3), np.uint8)
-    img3[:20, :20] = 200
-    core.clone_stamp(img3, (4, 4), (38, 38), 10)      # 目标越界
-    check("越界目标自动裁剪不崩溃", img3[39, 39, 0] == 200 and img3[20, 39, 0] == 0)
+    img3 = np.full((40, 40, 3), 128, np.uint8)
+    core.copy_patch(img3, (5, 5, 20, 20), (5, 5, 20, 20), 0.3)     # 源=目标
+    check("源目标重叠安全", bool(np.all(np.isfinite(img3))) and float(img3.mean()) > 0)
+
+    img4 = np.zeros((40, 40, 3), np.uint8)
+    img4[:20] = 200
+    core.copy_patch(img4, (0, 0, 40, 20), (30, 30, 60, 60), 0.0)   # 目标越界
+    check("目标越界自动裁剪不崩溃", img4[39, 39, 0] == 200)
+
+    img5 = np.zeros((40, 40, 3), np.uint8)
+    img5[:20] = 200
+    core.copy_patch(img5, (0, 0, 40, 20), (0, 20, 40, 40), 0.5)    # 羽化边缘
+    check("羽化边缘平滑过渡", 0 < img5[20, 20, 0] < 200
+          and img5[33, 33, 0] == 200)
 
 
 def test_contrast_strength():
@@ -480,6 +499,82 @@ def test_dehaze_no_blackout():
     for v in (-50, -100):
         out = core.process(core.Adjustments(dehaze=v), rgb)
         check(f"去朦胧 {v}（加雾）降低对比", float(out.std()) < float(base.std()))
+
+
+def test_geometry():
+    """裁剪 / 旋转 / 拉直：几何变换与蒙版坐标同步。"""
+    import cv2
+    rng = np.random.default_rng(21)
+    rgb = (rng.random((200, 300, 3)) * 255).astype(np.uint8)
+
+    def make_masks():
+        return [
+            core.MaskState(kind="linear", x1=0.2, y1=0.8, x2=0.7, y2=0.3,
+                           feather=25),
+            core.MaskState(kind="radial", cx=0.4, cy=0.6, radius=0.2, aspect=1.6,
+                           angle=30.0, feather=20),
+            core.MaskState(kind="brush", size=8, feather=15,
+                           strokes=[[(0.3, 0.3), (0.5, 0.45)], [(0.7, 0.8)]]),
+        ]
+
+    # ---- 90° 旋转：无损 + 蒙版同步（与光栅旋转对比；容差涵盖半像素/羽化网格差异）
+    r90 = core.rotate90(rgb, 1)
+    check("rot90 形状互换", r90.shape == (300, 200, 3))
+    check("rot90 四次还原", np.array_equal(core.rotate90(rgb, 4), rgb))
+    for k in (1, 2, 3):
+        ms = make_masks()
+        r0 = [core.render_mask(m, rgb.shape[:2]) for m in ms]
+        ns = core.remap_masks_rot90(ms, k, rgb.shape[:2])
+        diffs = [float(np.max(np.abs(np.rot90(r, k) - core.render_mask(m, ns))))
+                 for r, m in zip(r0, ms)]
+        check(f"rot90 k={k} 蒙版同步（最大差 {max(diffs):.3f}）", max(diffs) < 0.2)
+
+    # ---- 裁剪：像素切片 + 蒙版同步
+    out, map_point, ns = core.crop_rotate(rgb, (0.1, 0.2, 0.6, 0.9), 0.0)
+    check("裁剪尺寸与内容正确", out.shape == (140, 150, 3)
+          and np.array_equal(out, rgb[40:180, 30:180]))
+    ms = make_masks()
+    r0 = [core.render_mask(m, rgb.shape[:2]) for m in ms]
+    core.remap_mask_geometry(ms, map_point, rgb.shape[:2], ns)
+    diffs = [float(np.max(np.abs(r0[i][40:180, 30:180]
+                                 - core.render_mask(ms[i], ns))))
+             for i in range(3)]
+    check(f"裁剪蒙版同步（最大差 {max(diffs):.3f}）", max(diffs) < 0.2)
+
+    # ---- 拉直：画布不变、点映射与矩阵一致（最近邻 + 单点验证）
+    dot = np.zeros((200, 300, 3), np.uint8)
+    dot[60, 100] = 255
+    rot10, m10 = core.rotate_image(dot, 10.0, interpolation=cv2.INTER_NEAREST)
+    exp = m10 @ np.array([100.0, 60.0, 1.0])
+    ys, xs = np.nonzero(rot10[..., 0])
+    check("拉直画布尺寸不变", rot10.shape == dot.shape)
+    check("拉直点映射与矩阵一致",
+          len(xs) == 1 and abs(xs[0] - exp[0]) <= 1.0 and abs(ys[0] - exp[1]) <= 1.0)
+
+    # ---- 拉直 + 蒙版同步（仅在旋转有效区内对比）
+    a = 12.0
+    out, map_point, ns = core.crop_rotate(rgb, (0, 0, 1, 1), a)
+    check("拉直后画布不变", ns == (200, 300))
+    ms = make_masks()
+    r0 = [core.render_mask(m, rgb.shape[:2]) for m in ms]
+    core.remap_mask_geometry(ms, map_point, rgb.shape[:2], ns, angle_delta=-a)
+    x0, y0, x1, y1 = core.fit_rect_in_rotation((0, 0, 300, 200), (200, 300), a)
+    check("最大有效区在画布内", 0 <= x0 < x1 <= 300 and 0 <= y0 < y1 <= 200)
+    ma = core.rotation_matrix(rgb.shape[:2], a)
+    raster = [cv2.warpAffine(r, ma, (300, 200), flags=cv2.INTER_LINEAR,
+                             borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+              for r in r0]
+    diffs = [float(np.max(np.abs(raster[i][y0:y1, x0:x1]
+                                 - core.render_mask(ms[i], ns)[y0:y1, x0:x1])))
+             for i in range(3)]
+    check(f"拉直蒙版同步（有效区内最大差 {max(diffs):.3f}）", max(diffs) < 0.25)
+
+    # ---- 有效区收缩：角度越大越小
+    r5 = core.fit_rect_in_rotation((0, 0, 300, 200), (200, 300), 5.0)
+    r30 = core.fit_rect_in_rotation((0, 0, 300, 200), (200, 300), 30.0)
+    area5 = (r5[2] - r5[0]) * (r5[3] - r5[1])
+    area30 = (r30[2] - r30[0]) * (r30[3] - r30[1])
+    check("拉直角度越大有效区越小", area5 > area30 > 0)
 
 
 def test_radial_shape():
@@ -612,6 +707,30 @@ def test_parallel_equals_serial():
     check("蒙版渲染器切片有效",
           core.MaskRenderer(p2.masks, rgb.shape[:2]).get(1, 800, 1000, rgb.shape[1]).shape
           == (200, rgb.shape[1]))
+
+    # 仅蒙版局部效果（全局效果全 0）：halo / 低频图 / 全局统计必须同样覆盖蒙版 adj，
+    # 否则分块各自为政产生接缝甚至整体不一致
+    p3 = core.Adjustments()
+    mm = core.MaskState(kind="radial", cx=0.5, cy=0.5, radius=0.5, feather=10)
+    mm.adj.clarity = 60
+    mm.adj.sharpen = 80
+    mm.adj.denoise = 100
+    mm.adj.dehaze = 40
+    p3.masks = [mm]
+    rgb3 = (np.random.default_rng(3).random((900, 700, 3)) * 255).astype(np.uint8)
+    lin3 = core.rgb8_to_linear(rgb3)
+    par3 = core.process_linear(p3, lin3)
+    ser3 = core._process_band(p3, lin3)
+    check("仅蒙版局部效果并行逐位一致（无接缝）", np.array_equal(par3, ser3))
+
+    # 大图去朦胧：暗通道高斯半径 4σ 超过固定 64 后，halo 必须按 4σ+1 动态扩展
+    p4 = core.Adjustments()
+    p4.dehaze = 60
+    rgb4 = (np.random.default_rng(4).random((3900, 4100, 3)) * 255).astype(np.uint8)
+    lin4 = core.rgb8_to_linear(rgb4)
+    par4 = core.process_linear(p4, lin4)
+    ser4 = core._process_band(p4, lin4)
+    check("大图去朦胧并行逐位一致（动态 halo）", np.array_equal(par4, ser4))
 
 
 # ======================================================================
@@ -940,21 +1059,30 @@ def run_ui_smoke() -> int:
               window.panel.curve._params is window.params)
         check("全局曲线未被污染", len(window.params.curves["master"]) == 2)
 
-        # ---- 仿制图章 ----
+        # ---- 仿制图章（矩形取样覆盖）----
         window._toggle_stamp(True)
         check("图章模式进入", window.preview.stamp_mode())
-        window.preview.cloneSampled.emit(0.25, 0.25)
-        window.preview.cloneStrokePoint.emit(0.6, 0.6)
-        window.preview.cloneStrokePoint.emit(0.65, 0.6)
-        window.preview.cloneStrokeFinished.emit()
-        check("图章修改像素", window._retouch_full is not None
+        window.preview.cloneApplyRequested.emit((0.1, 0.1, 0.2, 0.2))
+        check("无源矩形时安全拦截", window._retouch_full is None)
+        window.preview.cloneSourcePicked.emit((0.25, 0.25, 0.45, 0.45))
+        check("源矩形已记录", window._stamp_src_rect == (0.25, 0.25, 0.45, 0.45)
+              and window.preview.stamp_source() == (0.25, 0.25, 0.45, 0.45))
+        window.preview.cloneApplyRequested.emit((0.55, 0.55, 0.75, 0.75))
+        check("覆盖修改像素", window._retouch_full is not None
               and not np.array_equal(window._retouch_full, window.source))
-        check("图章笔迹已记录", len(window._clone_ops) == 1)
-        check("图章后全图源已切换", window.processor._sources.get("full")
-              is window._retouch_full)
+        check("覆盖记录一笔", len(window._clone_ops) == 1)
+        check("目标内容来自源区域（内部逐位一致）",
+              np.array_equal(window._retouch_full[1710:2190, 1160:1440],
+                             window.source[810:1290, 560:840]))
+        full_src = window.processor._sources.get("full")
+        check("图章后全图源已切换（线程持有私有副本）",
+              full_src is not window._retouch_full
+              and np.array_equal(full_src, window._retouch_full))
         window._on_stamp_undo()
         check("图章撤销还原", window._retouch_full is None
-              and window.processor._sources.get("full") is window.source)
+              and np.array_equal(window.processor._sources.get("full"),
+                                 window.source)
+              and window.processor._sources.get("full") is not window.source)
         window._on_escape()
         check("Esc 退出图章模式", not window.preview.stamp_mode())
 
@@ -999,8 +1127,170 @@ def run_ui_smoke() -> int:
         window.preview.zoom_one_to_one()
         check("1:1 缩放生效", window.preview.zoom > 1.0)
         window.preview.zoom_fit()
+        hist = core.linear_histograms(window._last_frame)
+        window.panel.set_histograms(hist)
+        check("直方图可更新", window.panel.curve.editor._hist is hist)
         window.panel.set_histograms(None)
-        check("直方图可更新", True)
+        check("直方图可清空", window.panel.curve.editor._hist is None)
+
+        # ---- 色轮方向（环与拖点必须一致，不能上下镜像）----
+        import threading
+        import time as _time
+
+        import ui_widgets
+        from PySide6.QtCore import QPointF
+        from ui_widgets import _DISC_R, ColorWheel
+
+        cw = ColorWheel()
+        cw.resize(cw.sizeHint())
+        c0 = QPointF(cw.width() / 2.0, cw.height() / 2.0)
+        cw._update_from_pos(QPointF(c0.x() + 20, c0.y()))
+        check("色轮右侧拖点取 0°", abs(cw.hue_sat()[0]) < 1.0)
+        cw._update_from_pos(QPointF(c0.x(), c0.y() - 20))
+        check("色轮顶部拖点取 90°", abs(cw.hue_sat()[0] - 90.0) < 1.0)
+        cw.set_hue_sat(90.0, 1.0)
+        cw_img = cw.grab().toImage()
+        rr = int(_DISC_R - 3)
+        top_px = cw_img.pixelColor(int(c0.x()), int(c0.y()) - rr)
+        bot_px = cw_img.pixelColor(int(c0.x()), int(c0.y()) + rr)
+        ring_px = cw_img.pixelColor(int(c0.x()), int(c0.y()) - int(_DISC_R + 5))
+        check("色轮 90° 拖点画在顶部（与色环一致）",
+              top_px.saturation() > 100 and 60 <= top_px.hue() <= 140)
+        check("色轮底部无拖点", bot_px.saturation() < 60)
+        check("色环顶部为绿色系", ring_px.saturation() > 100
+              and 60 <= ring_px.hue() <= 140)
+
+        # ---- 蒙版叠加层缓存上限 ----
+        window.panel.mask.create_mask("linear")
+        for k in range(40):
+            window.params.masks[0].x2 = 0.3 + 0.001 * k
+            window._refresh_mask_overlays()
+        check("叠加层缓存有上限", len(window._overlay_cache)
+              <= window._OVERLAY_CACHE_MAX)
+        window.reset_adjustments()
+
+        # ---- 图章源矩形保存归一化坐标 ----
+        window.preview.set_stamp_source((0.25, 0.5, 0.5, 0.75))
+        window.preview.zoom_at(2.0)
+        check("图章源矩形保存归一化坐标",
+              window.preview.stamp_source() == (0.25, 0.5, 0.5, 0.75))
+        window.preview.set_stamp_source(None)
+        window.preview.zoom_fit()
+
+        # ---- ProcessorThread 异步行为（真实线程，非同步模式）----
+        def _wait_until(pred, timeout=5.0):
+            t0 = _time.monotonic()
+            while not pred():
+                if _time.monotonic() - t0 > timeout:
+                    return False
+                app.processEvents()
+                _time.sleep(0.01)
+            return True
+
+        small_src = (np.random.default_rng(5).random((40, 60, 3))
+                     * 255).astype(np.uint8)
+        pt = ui_widgets.ProcessorThread()
+        frames: list = []
+        pt.frameReady.connect(lambda arr, rid, full: frames.append(rid))
+        pt.set_source(ui_widgets.PREVIEW, small_src)
+        check("set_source 持有私有副本",
+              pt._sources[ui_widgets.PREVIEW] is not small_src
+              and np.array_equal(pt._sources[ui_widgets.PREVIEW], small_src))
+
+        gate = threading.Event()
+        entered: list = []
+        orig_process = ui_widgets.process_linear
+
+        def gated_process(params, lin, should_cancel=None):
+            entered.append(1)
+            # 模拟真实渲染：阻塞期间周期性让出并轮询取消（分块之间检查），
+            # gate 置位或超时后正常完成
+            deadline = _time.monotonic() + 5.0
+            while not gate.wait(0.02):
+                if should_cancel is not None and should_cancel():
+                    raise core.CancelledError("已取消")
+                if _time.monotonic() > deadline:
+                    break
+            return np.zeros(lin.shape, np.uint8)
+
+        old_sync = ui_widgets.SYNC_MODE
+        ui_widgets.process_linear = gated_process
+        ui_widgets.SYNC_MODE = False
+        try:
+            pt.start()
+            pj = core.Adjustments()
+            pj.exposure = 0.1
+            pt.submit(pj, ui_widgets.PREVIEW)          # rid1：占住 worker
+            check("异步:任务已进入渲染", _wait_until(lambda: len(entered) >= 1))
+            pt.submit(pj, ui_widgets.PREVIEW)          # rid2：入槽
+            pt.submit(pj, ui_widgets.PREVIEW)          # rid3：覆盖 rid2
+            gate.set()
+            check("异步:合并后两帧到齐", _wait_until(lambda: len(frames) >= 2))
+            check("异步:中间任务被合并（只执行 rid1 与 rid3）", frames == [1, 3])
+
+            gate.clear()
+            pt.submit(pj, ui_widgets.PREVIEW)          # rid4：占住 worker
+            # 第 1 阶段 gated 已进入 2 次（rid1/rid3），必须等到第 3 次才是 rid4，
+            # 否则 urgent 提交可能赶在 worker 取走 rid4 之前，rid4 被合并覆盖
+            check("异步:rid4 已进入渲染", _wait_until(lambda: len(entered) >= 3))
+            pt.submit(pj, ui_widgets.PREVIEW, urgent=True)   # rid5：保存类任务
+            pt.submit(pj, ui_widgets.PREVIEW)          # rid6：普通任务，不得覆盖 rid5
+            gate.set()
+            check("异步:三帧到齐", _wait_until(lambda: len(frames) >= 5))
+            check("异步:紧急任务不被普通任务覆盖", frames[2:] == [4, 5, 6])
+
+            gate.clear()
+            pt.submit(pj, ui_widgets.PREVIEW)          # rid7：阻塞且响应取消
+            # 前 5 次进入 = rid1/3/4/5/6，第 6 次才是 rid7
+            check("异步:rid7 已进入渲染", _wait_until(lambda: len(entered) >= 6))
+            t0 = _time.monotonic()
+            pt.stop()
+            check("异步:stop 协作取消后线程快速退出",
+                  not pt.isRunning() and _time.monotonic() - t0 < 3.0
+                  and len(frames) == 5)
+        finally:
+            ui_widgets.process_linear = orig_process
+            ui_widgets.SYNC_MODE = old_sync
+
+        # ---- 裁剪 / 旋转 ----
+        window.params.masks.append(
+            core.MaskState(kind="radial", cx=0.75, cy=0.75, radius=0.2, feather=20))
+        window.act_crop.trigger()
+        check("裁剪模式进入", window.preview.crop_mode()
+              and window.crop_bar.isVisible())
+        window.preview.set_crop_mode(True, rect={"x0": 0.25, "y0": 0.25,
+                                                 "x1": 0.75, "y1": 0.75})
+        check("裁剪框可设置", abs(window.preview.crop_rect()["x0"] - 0.25) < 1e-6)
+        window._apply_crop()
+        check("裁剪后源图尺寸减半",
+              window.source.shape[:2] == (IMG_H // 2, IMG_W // 2))
+        m_geo = window.params.masks[0]
+        check("裁剪后蒙版中心同步",
+              abs(m_geo.cx - 1.0) < 0.01 and abs(m_geo.cy - 1.0) < 0.01)
+        check("裁剪后退出模式", not window.preview.crop_mode()
+              and not window.act_crop.isChecked())
+        window._rotate90(True)
+        check("右转90°尺寸互换",
+              window.source.shape[:2] == (IMG_W // 2, IMG_H // 2))
+        check("右转90°蒙版中心跟随",
+              abs(m_geo.cx) < 0.01 and abs(m_geo.cy - 1.0) < 0.01)
+        window._rotate90(False)
+        check("左转抵消右转",
+              window.source.shape[:2] == (IMG_H // 2, IMG_W // 2))
+
+        window.act_crop.trigger()
+        window.crop_bar.angle_row.set_value(10.0, emit=True)
+        check("拉直角度写入", abs(window._crop_angle - 10.0) < 1e-6)
+        window._apply_crop()
+        h2, w2 = window.source.shape[:2]
+        check("拉直应用成功且尺寸收缩", 0 < w2 < IMG_W // 2 and 0 < h2 < IMG_H // 2)
+
+        window.act_crop.trigger()
+        window.preview.set_crop_mode(True, rect={"x0": 0.3, "y0": 0.3,
+                                                 "x1": 0.7, "y1": 0.7})
+        window._on_escape()
+        check("Esc 取消裁剪不改动", not window.preview.crop_mode()
+              and window.source.shape[:2] == (h2, w2))
 
         # ---- RAW（rawpy 桩模块验证加载路径）----
         import types
@@ -1068,8 +1358,8 @@ def run_ui_smoke() -> int:
         check("无图像时保存被安全拦截", window._submit("full") == -1)
         window.source = gray
 
-        window.close()
-        check("窗口正常关闭", True)
+        closed = window.close()
+        check("窗口正常关闭", closed and not window.isVisible())
     return 0
 
 
@@ -1090,7 +1380,8 @@ def main():
     print("== 去朦胧不发黑 =="); test_dehaze_no_blackout()
     print("== 蒙版 ==");        test_masks()
     print("== 蒙版高级 ==");    test_mask_advanced()
-    print("== 仿制图章 ==");    test_clone_stamp()
+    print("== 矩形取样 ==");    test_patch_copy()
+    print("== 几何变换 ==");    test_geometry()
     print("== 径向形状 ==");    test_radial_shape()
     print("== 自动调色 ==");    test_auto_rule()
     print("== AI 参数解析 =="); test_ai_sanitize()
