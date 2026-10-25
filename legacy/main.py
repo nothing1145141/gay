@@ -9,6 +9,9 @@ from __future__ import annotations
 import os
 import sys
 
+# 从 legacy/ 子目录运行：把仓库根目录加入导入路径（core/ui_* 在根目录）
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 
 def _excepthook(exc_type, exc_value, exc_tb):
     import traceback

@@ -348,6 +348,200 @@ def test_ai_sanitize():
     check("AI 解析:NaN/Infinity 全部被丢弃", auto.sanitize_ai_params(nan_case) == {})
 
 
+def test_ai_mask():
+    import auto
+
+    # ---- 像素级掩码（mask_png）：编解码往返 / 渲染优先级 / 缓存键 / 重映射 ----
+    prob = np.zeros((100, 150), np.float32)
+    prob[20:80, 30:120] = np.linspace(0, 1, 90)[None, :]    # 软渐变（256 级）
+    b64, pw, ph = core.encode_mask_png(prob)
+    back = core.decode_mask_png(b64)
+    check("AI 像素掩码:编解码往返（形状/软边界/量化<1/255）",
+          back.shape == (100, 150) and abs(float(back.max()) - 1.0) < 0.01
+          and len(np.unique(back)) >= 90
+          and float(np.abs(back - np.round(prob * 255) / 255).max()) < 0.005)
+    check("AI 像素掩码:空/坏输入安全",
+          core.decode_mask_png("").size == 0
+          and core.decode_mask_png("not-base64!!").size == 0)
+
+    # 渲染：mask_png 优先于 grid（采样点取渐变内部，避免边界插值稀释）
+    m = core.MaskState(kind="ai", feather=0,
+                       grid=["1100"] * 4, grid_w=4, grid_h=4,
+                       mask_png=b64, mask_w=pw, mask_h=ph)
+    r = core.render_mask(m, (300, 450))
+    check("AI 像素掩码:渲染 mask_png 优先（中值≈0.5）",
+          r.shape == (300, 450) and abs(float(r[150, 226]) - 0.5) < 0.03
+          and float(r[150, 96]) < 0.05 and float(r[150, 356]) > 0.95)
+    m2 = core.MaskState(kind="ai", feather=0,
+                        grid=["1100"] * 4, grid_w=4, grid_h=4)
+    r2 = core.render_mask(m2, (300, 450))
+    check("AI 像素掩码:空 mask_png 回退 grid",
+          float(r2[:, :112].min()) > 0.9 and float(r2[:, 300:].max()) < 0.1)
+
+    k0 = core.mask_cache_key(m, (300, 450))
+    m.mask_png = core.encode_mask_png(1.0 - prob)[0]
+    check("AI 像素掩码:缓存键随掩码内容变化",
+          k0 != core.mask_cache_key(m, (300, 450)))
+
+    # 几何重映射：裁掉右半（nx'=2nx）——新图右端对应原列 75（值 0.5）
+    m3 = core.MaskState(kind="ai", feather=0, mask_png=b64, mask_w=pw, mask_h=ph)
+    core.remap_mask_geometry([m3], lambda nx, ny: (nx * 2.0, ny), (450, 300), (225, 300))
+    r3 = core.decode_mask_png(m3.mask_png)
+    check("AI 像素掩码:裁剪右半后右端≈0.5/左端≈0",
+          abs(float(r3[50, -1]) - 0.5) < 0.06 and float(r3[50, 0]) < 0.06)
+    m4 = core.MaskState(kind="ai", feather=0, mask_png=b64, mask_w=pw, mask_h=ph)
+    core.remap_masks_rot90([m4], 3, (450, 300))
+    r4 = core.decode_mask_png(m4.mask_png)
+    check("AI 像素掩码:90° 旋转后掩码有效",
+          m4.mask_w == pw and m4.mask_h == ph and float(r4.max()) > 0.95)
+
+    # ---- 网格 <-> 数组往返与容错 ----
+    rows = ["1100", "0110", "0011"]
+    arr = core.grid_to_array(rows, 4, 3)
+    check("AI 网格:解析形状与内容",
+          arr.shape == (3, 4) and arr[0, 0] == 1 and arr[0, 2] == 0)
+    check("AI 网格:数组回编码无损", core.array_to_grid(arr) == rows)
+    bad = core.grid_to_array(["1x0", "0"], 3, 2)     # 杂散字符/缺行补 0
+    check("AI 网格:杂散字符与短行安全降级",
+          core.array_to_grid(bad) == ["100", "000"])
+    check("AI 网格:空网格安全", core.grid_to_array([], 0, 0).size == 0)
+
+    # ---- 渲染 ----
+    shape = (180, 240)
+    m = core.MaskState(kind="ai", ai_target="sky", grid=rows, grid_w=4, grid_h=3,
+                       feather=30)
+    am = core.render_mask(m, shape)
+    check("AI 蒙版:渲染尺寸与范围",
+          am.shape == shape and 0 <= am.min() and am.max() <= 1.0)
+    check("AI 蒙版:左上网 1 -> 左上区域接近 1", float(am[:40, :40].mean()) > 0.9)
+    check("AI 蒙版:右上网 0 -> 右上区域接近 0", float(am[:40, -40:].mean()) < 0.05)
+    check("AI 蒙版:反向互补",
+          abs(float((core.render_mask(
+              core.MaskState(kind="ai", grid=rows, grid_w=4, grid_h=3,
+                             feather=0, invert=True), shape)
+              + core.render_mask(core.MaskState(
+                  kind="ai", grid=rows, grid_w=4, grid_h=3, feather=0),
+                  shape)).max()) - 1.0) < 1e-5)
+    check("AI 蒙版:空网格渲染全 0", float(core.render_mask(
+        core.MaskState(kind="ai"), shape).max()) == 0.0)
+
+    # ---- 缓存键 ----
+    k0 = core.mask_cache_key(m, shape)
+    m_diff = core.MaskState(kind="ai", grid=["1100", "0110", "0010"],
+                            grid_w=4, grid_h=3, feather=30)
+    check("AI 蒙版:缓存键随网格变化", k0 != core.mask_cache_key(m_diff, shape))
+    check("AI 蒙版:缓存键随羽化变化",
+          k0 != core.mask_cache_key(
+              core.MaskState(kind="ai", grid=rows, grid_w=4, grid_h=3,
+                             feather=31), shape))
+    check("AI 蒙版:同网格同羽化键稳定", k0 == core.mask_cache_key(
+        core.MaskState(kind="ai", grid=list(rows), grid_w=4, grid_h=3,
+                       feather=30), shape))
+
+    # ---- 进流水线（蒙版局部调整作用于网格覆盖区）----
+    img = np.full(shape + (3,), 0.35, np.float32)
+    m.adj = core.MaskAdjustments(exposure=1.0)
+    out = core.apply_masked_adjustments(img, [m])
+    check("AI 蒙版:局部调整作用于网格 1 区",
+          float(out[10, 10].mean()) > float(out[10, -10].mean()))
+
+    # ---- 几何同步 ----
+    m2 = core.MaskState(kind="ai", grid=rows, grid_w=4, grid_h=3, feather=0)
+    core.remap_mask_geometry([m2], lambda nx, ny: (nx * 2.0, ny), (240, 180), (120, 180))
+    a2 = core.grid_to_array(m2.grid, 4, 3)
+    check("AI 蒙版:裁剪右半后出界格丢弃、保留格重定位",
+          a2[0, 1] == 1 and a2[1, 3] == 1 and a2[2, :].max() == 0)
+    m3 = core.MaskState(kind="ai", grid=rows, grid_w=4, grid_h=3, feather=0)
+    core.remap_masks_rot90([m3], 3, (240, 180))
+    before = core.grid_to_array(rows, 4, 3).sum()
+    after = core.grid_to_array(m3.grid, m3.grid_w, m3.grid_h).sum()
+    check("AI 蒙版:90° 旋转网格重排（1 的数量不减少）", after >= before - 1)
+
+    # ---- auto 层：网格解析 / 清理 / 配置 ----
+    gw, gh = auto._seg_grid_dims(np.zeros((300, 400, 3), np.uint8))
+    check("AI 分割:网格尺寸按宽高比（长边 96）", (gw, gh) == (96, 72))
+    parsed = auto._parse_grid({"rows": ["1 1 0 0", "0110", "0011"]}, 4, 3)
+    check("AI 分割:容忍行内空格/短行补齐", parsed == ["1100", "0110", "0011"])
+    parsed2 = auto._parse_grid([["1", "0"], ["0", "1"]], 2, 2)
+    check("AI 分割:容忍数字列表", parsed2 == ["10", "01"])
+    try:
+        auto._parse_grid({"rows": []}, 4, 3)
+        ok = False
+    except ValueError:
+        ok = True
+    check("AI 分割:空回复报错", ok)
+    cleaned = auto._cleanup_grid(["1111", "1001", "1111"])
+    filled = core.grid_to_array(cleaned, 4, 3)
+    check("AI 分割:闭运算填小孔", filled[1, 1] == 1 and filled[1, 2] == 1)
+    cleaned2 = auto._cleanup_grid(["0000", "0100", "0000", "0000"])
+    check("AI 分割:开运算去孤点", core.grid_to_array(cleaned2, 4, 4).sum() == 0)
+    cleaned3 = auto._cleanup_grid(["1000", "0000", "0000", "0000"])
+    check("AI 分割:角落孤点同样去除（形态学补边）",
+          core.grid_to_array(cleaned3, 4, 4).sum() == 0)
+
+    import os
+    envs = ("PHOTOLAB_AI_BASE_URL", "PHOTOLAB_AI_KEY", "PHOTOLAB_AI_MODEL")
+    saved = {k: os.environ.get(k) for k in envs}
+    try:
+        for k in envs:
+            os.environ.pop(k, None)
+        check("AI 配置:未配置返回 None", auto.resolve_config() is None)
+        check("AI 配置:UI 传入优先",
+              auto.resolve_config({"base_url": "http://x/v1/", "api_key": "k",
+                                   "model": "m"}) == ("http://x/v1", "k", "m"))
+        os.environ.update({"PHOTOLAB_AI_BASE_URL": "http://env", "PHOTOLAB_AI_KEY": "ek",
+                           "PHOTOLAB_AI_MODEL": "em"})
+        check("AI 配置:环境变量后备", auto.resolve_config(None) == ("http://env", "ek", "em"))
+        check("AI 配置:UI 传入覆盖环境变量",
+              auto.resolve_config({"base_url": "http://x", "api_key": "k",
+                                   "model": "m"}) == ("http://x", "k", "m"))
+        check("AI 配置:旧入口等价", auto.resolve_candidates() == [("http://env", "ek", "em")])
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def test_mask_cache():
+    """蒙版跨任务 LRU：几何不变时第二次渲染必须命中缓存且结果逐位一致。"""
+    core.clear_mask_cache()
+    shape = (600, 800)
+    masks = [
+        core.MaskState(kind="ai", ai_target="sky",
+                       grid=["11001100"] * 9, grid_w=8, grid_h=9, feather=30),
+        core.MaskState(kind="radial", cx=0.5, cy=0.5, radius=0.3, feather=25),
+        core.MaskState(kind="linear", x1=0.1, y1=0.2, x2=0.9, y2=0.8, feather=20),
+    ]
+    for m in masks:                        # 局部调整非默认 -> 非平凡，才会渲染
+        m.adj = core.MaskAdjustments(exposure=0.3)
+    r1 = core.MaskRenderer(masks, shape)
+    core.mask_cache_stats["hit"] = core.mask_cache_stats["miss"] = 0
+    r2 = core.MaskRenderer(masks, shape)          # 参数变化 -> 新任务，蒙版未变
+    check("蒙版缓存:第二次任务全部命中", core.mask_cache_stats["hit"] == 3
+          and core.mask_cache_stats["miss"] == 0)
+    for i in range(3):
+        a = r1.get(i, 0, 40, 800)
+        b = r2.get(i, 0, 40, 800)
+        check(f"蒙版缓存:蒙版{i} 命中结果与首次逐位一致", np.array_equal(a, b))
+
+    # 几何变化 -> 键变化 -> 不命中旧值
+    masks[1].radius = 0.4
+    core.MaskRenderer(masks, shape)
+    check("蒙版缓存:几何变化触发重算", core.mask_cache_stats["miss"] == 1)
+
+    # 缓存淘汰不破坏正确性：塞满后重渲染首个蒙版仍逐位一致
+    for k in range(core._MASK_CACHE_MAX + 2):
+        m = core.MaskState(kind="radial", cx=0.1 * (k % 10), cy=0.5, radius=0.3)
+        m.adj = core.MaskAdjustments(exposure=0.3)
+        core.MaskRenderer([m], shape)
+    r3 = core.MaskRenderer(masks[:1], shape)
+    check("蒙版缓存:淘汰后重算结果一致",
+          np.array_equal(r3.get(0, 0, 40, 800), r1.get(0, 0, 40, 800)))
+    core.clear_mask_cache()
+
+
 def test_gpu_matches_cpu():
     """有 OpenCL GPU 时，GPU 结果必须与 CPU 接近（浮点实现允许微小舍入差）。"""
     try:
@@ -744,6 +938,7 @@ def run_ui_smoke() -> int:
     from PySide6.QtWidgets import QApplication
 
     import core
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "legacy"))
     import ui_window
     from ui_window import MainWindow
     from ui_widgets import apply_dark_theme
@@ -1137,6 +1332,8 @@ def run_ui_smoke() -> int:
         import threading
         import time as _time
 
+        import sys as _sys, os as _os
+        _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "legacy"))
         import ui_widgets
         from PySide6.QtCore import QPointF
         from ui_widgets import _DISC_R, ColorWheel
@@ -1385,6 +1582,8 @@ def main():
     print("== 径向形状 ==");    test_radial_shape()
     print("== 自动调色 ==");    test_auto_rule()
     print("== AI 参数解析 =="); test_ai_sanitize()
+    print("== AI 蒙版 ==");     test_ai_mask()
+    print("== 蒙版缓存 ==");    test_mask_cache()
     print("== GPU 一致性 ==");  test_gpu_matches_cpu()
 
     if RUN_UI:

@@ -1,14 +1,15 @@
-"""PhotoLab 自动调色：规则版 + AI 版。
+"""PhotoLab 自动调色 + AI 蒙版：规则版 + AI 版。
 
-工具栏两个入口：
 - 「自动」：纯本地规则（灰世界白平衡 + 直方图自动色阶），瞬时、可预期；
-- 「AI 调色」：把降采样图与统计数据发给视觉大模型，由它返回参数 JSON。
-  端点为任意 OpenAI 兼容 chat/completions 服务，解析顺序：
-    1. 环境变量 PHOTOLAB_AI_BASE_URL / PHOTOLAB_AI_KEY / PHOTOLAB_AI_MODEL
-    2. ZCode 配置（~/.zcode/v2/provider_config.json）中自动发现视觉模型，
-       优先实测可用的 DeepSeek-V4-Flash-Vision-Exp
+- 「AI 调色」：把降采样图与统计数据发给视觉大模型，由它返回参数 JSON；
+- 「AI 蒙版」：让视觉大模型按网格分割图像（主体/人物/背景/天空），
+  返回 0/1 网格，由 core 渲染成软边蒙版。
 
-两个版本都只产出参数字典，渲染仍由 core 流水线完成，便于统一钳制与撤销。
+端点为任意 OpenAI 兼容 chat/completions 服务，配置解析顺序：
+    1. 前端「AI 设置」界面传入的 {base_url, api_key, model}
+    2. 环境变量 PHOTOLAB_AI_BASE_URL / PHOTOLAB_AI_KEY / PHOTOLAB_AI_MODEL
+
+两个版本都只产出参数/网格数据，渲染仍由 core 流水线完成，便于统一钳制与撤销。
 """
 from __future__ import annotations
 
@@ -17,7 +18,6 @@ import json
 import math
 import os
 import re
-import time
 import urllib.request
 
 import numpy as np
@@ -117,103 +117,77 @@ def suggest_rule(rgb8: np.ndarray) -> dict:
 
 
 # ======================================================================
-# 2. AI 版：端点发现 / 请求 / 解析
+# 2. AI 端点配置 / 请求 / 解析
 # ======================================================================
 
-# 实测可用的优先模型；其余按视觉特征名优先（注意 \dv 不匹配 "V4" 这类版本号）
-_PREFERRED_MODEL = "deepseek-v4-flash-vision-exp"
-_VISION_HINT = re.compile(r"vision|minicpm-v|vl-|\dv|qvq|internvl", re.I)
-_ZCODE_PROVIDERS = os.path.expanduser("~/.zcode/v2/provider_config.json")
-_candidates_cache: list | None = None
-_candidates_time: float = 0.0
+def resolve_config(cfg: dict | None = None) -> tuple | None:
+    """返回 (baseUrl, apiKey, model)；未配置返回 None。
 
-
-def _model_sort_key(model: str) -> tuple:
-    m = model.lower()
-    if m == _PREFERRED_MODEL:
-        return (0, m)
-    if "vision" in m:
-        return (1, m)
-    if _VISION_HINT.search(model):
-        return (2, m)
-    return (3, m)
-
-
-_models_cache: dict = {}      # baseUrl -> (时间戳, 模型 id 列表)
-_MODELS_TTL = 120.0           # 失败结果只短时缓存，避免瞬时网络故障被永久记住
-
-
-def _fetch_models(base: str, key: str) -> list:
-    """GET {base}/models（OpenAI 兼容）；成功会话内缓存，失败仅短时缓存后重试。"""
-    ent = _models_cache.get(base)
-    now = time.monotonic()
-    if ent is not None and (ent[1] or now - ent[0] < _MODELS_TTL):
-        return ent[1]
-    models: list = []
-    try:
-        req = urllib.request.Request(
-            base + "/models", headers={"Authorization": "Bearer " + key})
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            data = json.loads(resp.read())
-        models = [m.get("id", "") for m in data.get("data", []) if m.get("id")]
-    except Exception:
-        pass
-    _models_cache[base] = (now, models)
-    return models
-
-
-def _zcode_candidates() -> list:
-    """从 ZCode 配置发现 OpenAI 兼容端点与视觉模型（读配置 + 查 /models）。"""
-    out = []
-    try:
-        pc = json.load(open(_ZCODE_PROVIDERS, encoding="utf-8"))
-        rules = pc["config"]["providerConfigRules"]["providerRules"]
-    except Exception:
-        return out
-    for rule in rules:
-        c = rule.get("config", {})
-        if c.get("api", {}).get("type") != "openai-chat-completions":
-            continue
-        base = c["api"].get("baseUrl", "").rstrip("/")
-        key = c.get("access", {}).get("apiKey", "")
-        if not base or not key:
-            continue
-        seen = set()
-        # 供应商声明的个人模型优先
-        for m in c.get("personalModelIds", []):
-            if _VISION_HINT.search(m):
-                out.append((base, key, m))
-                seen.add(m)
-        # 再从 /models 全量列表补充视觉模型（如 DeepSeek-V4-Flash-Vision-Exp）
-        for m in _fetch_models(base, key):
-            if m not in seen and _VISION_HINT.search(m):
-                out.append((base, key, m))
-                seen.add(m)
-    return out
+    优先级：前端「AI 设置」传入的字典 > 环境变量
+    PHOTOLAB_AI_BASE_URL / PHOTOLAB_AI_KEY / PHOTOLAB_AI_MODEL。
+    """
+    c = cfg or {}
+    base = str(c.get("base_url") or "").rstrip("/")
+    key = str(c.get("api_key") or "")
+    model = str(c.get("model") or "")
+    if not (base and key and model):
+        base = os.environ.get("PHOTOLAB_AI_BASE_URL", "").rstrip("/")
+        key = os.environ.get("PHOTOLAB_AI_KEY", "")
+        model = os.environ.get("PHOTOLAB_AI_MODEL", "")
+    if base and key and model:
+        return base, key, model
+    return None
 
 
 def resolve_candidates() -> list:
-    """返回按优先级排序的 (baseUrl, apiKey, model) 候选列表。
+    """旧版 UI 兼容入口：环境变量配置的单一端点（可能为空列表）。"""
+    cfg = resolve_config()
+    return [cfg] if cfg else []
 
-    非空结果会话内缓存；空结果只缓存 _CANDIDATES_TTL 秒——一次瞬时网络
-    故障不应让 AI 功能在整个会话内不可用。
-    """
-    global _candidates_cache, _candidates_time
-    if _candidates_cache:
-        return _candidates_cache
-    if _candidates_cache is not None and \
-            time.monotonic() - _candidates_time < _MODELS_TTL:
-        return _candidates_cache
-    out = []
-    base = os.environ.get("PHOTOLAB_AI_BASE_URL", "").rstrip("/")
-    key = os.environ.get("PHOTOLAB_AI_KEY", "")
-    model = os.environ.get("PHOTOLAB_AI_MODEL", "")
-    if base and key and model:
-        out.append((base, key, model))            # 显式配置唯一优先
-    out.extend(sorted(set(_zcode_candidates()), key=lambda c: _model_sort_key(c[2])))
-    _candidates_cache = out
-    _candidates_time = time.monotonic()
-    return out
+
+def fetch_models(base: str, key: str, timeout: int = 8) -> list:
+    """GET {base}/models（OpenAI 兼容），返回模型 id 列表；失败抛异常。"""
+    req = urllib.request.Request(
+        base + "/models", headers={"Authorization": "Bearer " + key})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read())
+    return [m.get("id", "") for m in data.get("data", []) if m.get("id")]
+
+
+def _chat(base: str, key: str, model: str, messages: list,
+          timeout: int = 90, max_tokens: int = 2000,
+          temperature: float = 0.3) -> str:
+    """POST chat/completions，返回拼接后的文本内容。HTTP 错误带响应体消息。"""
+    body = {"model": model, "messages": messages, "temperature": temperature,
+            "max_tokens": max_tokens}
+    req = urllib.request.Request(
+        base + "/chat/completions", data=json.dumps(body).encode("utf-8"),
+        method="POST",
+        headers={"Authorization": "Bearer " + key,
+                 "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read())
+    except Exception as exc:
+        detail = ""
+        if hasattr(exc, "read"):                     # HTTPError 带响应体
+            try:
+                err = json.loads(exc.read().decode()).get("error", {})
+                detail = err.get("message", "") if isinstance(err, dict) else str(err)
+            except Exception:
+                pass
+        raise RuntimeError(f"{exc}{('：' + detail) if detail else ''}") from exc
+    content = data["choices"][0]["message"]["content"]
+    if isinstance(content, list):
+        # 部分实现把 content 拆成多段（{"type": "text", "text": ...}）
+        content = "".join(part.get("text", "")
+                          for part in content if isinstance(part, dict))
+    return str(content or "")
+
+
+def _no_config_error() -> RuntimeError:
+    return RuntimeError("未配置 AI 模型：请在顶栏「AI 设置」中填写 URL / API Key / "
+                        "模型 ID（OpenAI 兼容接口 + 视觉模型）")
 
 
 def _extract_json(text: str) -> dict:
@@ -360,44 +334,188 @@ def _encode_jpeg(rgb8: np.ndarray, quality: int = 88):
     return ok, buf.tobytes()
 
 
-def suggest_ai(rgb8: np.ndarray, timeout: int = 90) -> tuple:
+def suggest_ai(rgb8: np.ndarray, config: dict | None = None,
+               timeout: int = 90) -> tuple:
     """AI 自动调色：返回 (参数字典, 说明, 使用的模型描述)。
 
-    依次尝试候选端点；全部失败抛 RuntimeError。
+    config 为前端「AI 设置」传入的 {base_url, api_key, model}，缺省回退
+    环境变量；两者都没有时抛 RuntimeError。
     """
+    cfg = resolve_config(config)
+    if cfg is None:
+        raise _no_config_error()
+    base, key, model = cfg
     messages = _build_messages(rgb8)
-    errors = []
-    for base, key, model in resolve_candidates():
-        body = {"model": model, "messages": messages, "temperature": 0.3,
-                "max_tokens": 2000}
-        req = urllib.request.Request(
-            base + "/chat/completions", data=json.dumps(body).encode("utf-8"),
-            method="POST",
-            headers={"Authorization": "Bearer " + key,
-                     "Content-Type": "application/json"})
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                data = json.loads(resp.read())
-            content = data["choices"][0]["message"]["content"]
-            if isinstance(content, list):
-                # 部分实现把 content 拆成多段（{"type": "text", "text": ...}）
-                content = "".join(part.get("text", "")
-                                  for part in content if isinstance(part, dict))
-            text = str(content or "")
-            raw = _extract_json(text)
-            note = str(raw.get("note", "")).strip()[:100]
-            params = sanitize_ai_params(raw)
-            if not params:
-                errors.append(f"{model}: 返回参数为空")
-                continue
-            return params, note, f"{model}@{base}"
-        except Exception as exc:
-            detail = ""
-            if hasattr(exc, "read"):                 # HTTPError 带响应体
-                try:
-                    detail = json.loads(exc.read().decode()).get("error", {})
-                    detail = detail.get("message", "") if isinstance(detail, dict) else str(detail)
-                except Exception:
-                    pass
-            errors.append(f"{model}: {exc}{detail}")
-    raise RuntimeError("所有 AI 端点均失败：\n" + "\n".join(errors))
+    try:
+        text = _chat(base, key, model, messages, timeout=timeout)
+        raw = _extract_json(text)
+    except ValueError as exc:
+        raise RuntimeError(f"{model}: {exc}") from exc
+    note = str(raw.get("note", "")).strip()[:100]
+    params = sanitize_ai_params(raw)
+    if not params:
+        raise RuntimeError(f"{model}: 返回参数为空")
+    return params, note, f"{model}@{base}"
+
+
+# ======================================================================
+# 3. AI 蒙版：视觉大模型网格分割（主体 / 人物 / 背景 / 天空）
+# ======================================================================
+
+# 目标 -> (中文名, 提示词中的定义)
+AI_MASK_TARGETS = {
+    "subject": ("主体", "画面中最主要、最突出的拍摄主体（人物、动物、车辆、"
+                        "建筑、静物等），即摄影师想突出表现的对象；不包括背景环境"),
+    "person": ("人物", "所有出现的人物（脸部与身体，含多人、远景人物）；"
+                       "画面中没有任何人时全部填 '0'"),
+    "background": ("背景", "拍摄主体之外的背景环境（地面、墙面、植物、"
+                           "远处景物等一切非主体内容），与主体互补"),
+    "sky": ("天空", "天空区域（蓝天、白云、晚霞、星空等可见天空）；"
+                    "没有天空（室内/特写）时全部填 '0'"),
+}
+
+# 分辨率取舍：网格越细边界越准，但视觉模型在过细网格上错误率上升。
+# 96 为实测折中（4:3 横幅约 96×72），配合连通域清理与羽化后边界平滑；
+# 32~48 的粗网格在细目标（人物四肢、树枝间天空）上锯齿明显。
+_GRID_LONG_EDGE = 96
+
+
+def _seg_grid_dims(rgb8: np.ndarray, long_edge: int = _GRID_LONG_EDGE) -> tuple:
+    """按图像宽高比规划网格 (gw, gh)，长边固定、格子接近正方形。"""
+    h, w = rgb8.shape[:2]
+    if w >= h:
+        gw, gh = long_edge, max(4, round(h / w * long_edge))
+    else:
+        gw, gh = max(4, round(w / h * long_edge)), long_edge
+    return gw, gh
+
+
+def _cell01(x) -> str:
+    """列表行里的单元格 -> '0'/'1'（数字、布尔、"1"/"0" 字符串均可；坏值为 0）。"""
+    try:
+        return "1" if float(x) >= 0.5 else "0"
+    except (TypeError, ValueError):
+        return "0"
+
+
+def _parse_grid(raw, gw: int, gh: int) -> list:
+    """从模型回复中稳健解析 0/1 网格 -> ['0101...', ...] 共 gh 行、每行 gw 字符。
+
+    容忍：markdown 围栏（调用方已剥）、行内空格/逗号、数字列表、行数/列数
+    轻微不齐（截断补 0）。行数不足一半视为失败。
+    """
+    rows = None
+    if isinstance(raw, dict):
+        for k in ("rows", "grid", "mask"):
+            v = raw.get(k)
+            if isinstance(v, list) and v:
+                rows = v
+                break
+    elif isinstance(raw, list) and raw:
+        rows = raw
+    if not rows:
+        raise ValueError("回复中没有网格数据")
+    clean = []
+    for r in rows:
+        if isinstance(r, (list, tuple)):         # 容忍 0/1 数字（或 "0"/"1"）列表
+            r = "".join(_cell01(x) for x in r)
+        if not isinstance(r, str):
+            continue
+        s = "".join(ch for ch in r if ch in "01")
+        if s:
+            clean.append(s)
+    if len(clean) < max(2, gh // 2):
+        raise ValueError(f"网格行数不足（收到 {len(clean)} 行，需要 {gh}）")
+    out = [r[:gw].ljust(gw, "0") for r in clean[:gh]]
+    while len(out) < gh:
+        out.append("0" * gw)
+    return out
+
+
+_GRID_MIN_AREA = 3      # 面积小于此值的碎片/小孔直接清理（网格通常 48×36，1~2 格视为噪声）
+
+
+def _cleanup_grid(rows: list) -> list:
+    """网格级清理：去小连通域（碎点）+ 填不贴边的小孔。
+
+    用连通域而非形态学：开/闭运算的边框语义在图像边缘不一致（cv2 腐蚀默认
+    边框按极大值填充，贴边的孤立点删不掉；置 0 又会啃掉贴边的正常区域，
+    而天空/背景蒙版必然贴边）。连通域过滤对任意位置行为一致。
+    """
+    import cv2
+    arr = core.grid_to_array(rows, len(rows[0]) if rows else 0, len(rows))
+    if arr.size == 0 or float(arr.max()) == 0.0:
+        return core.array_to_grid(arr)
+    u8 = (arr >= 0.5).astype(np.uint8)
+    h, w = u8.shape
+    # 1) 去小连通域（孤点/碎块）
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(u8, connectivity=8)
+    for i in range(1, n):
+        if stats[i, cv2.CC_STAT_AREA] < _GRID_MIN_AREA:
+            u8[lab == i] = 0
+    # 2) 填不贴边的小孔（背景连通域面积小且不接触图像边缘 -> 视为孔洞）
+    inv = (u8 == 0).astype(np.uint8)
+    n2, lab2, stats2, _ = cv2.connectedComponentsWithStats(inv, connectivity=8)
+    for i in range(1, n2):
+        x, y, cw, ch, area = (int(stats2[i, j]) for j in range(5))
+        touches = x == 0 or y == 0 or x + cw >= w or y + ch >= h
+        if area < _GRID_MIN_AREA and not touches:
+            u8[lab2 == i] = 1
+    return core.array_to_grid(u8.astype(np.float32))
+
+
+def _build_seg_messages(rgb8: np.ndarray, target: str, gw: int, gh: int) -> list:
+    if target not in AI_MASK_TARGETS:
+        raise ValueError(f"未知的 AI 蒙版目标：{target}")
+    label, define = AI_MASK_TARGETS[target]
+    small = core.downscale_max_edge(rgb8, 768)
+    ok, buf = _encode_jpeg(small)
+    data_url = "data:image/jpeg;base64," + base64.b64encode(buf).decode()
+    prompt = (
+        "你是图像分割助手。任务：把图像划分为 "
+        f"{gw} 列 × {gh} 行 的网格，逐格判断其中心是否属于【{label}】。\n"
+        f"目标定义：{define}。\n\n"
+        "做法：先通读全图、确定目标的整体范围；再从第一行到最后一行、每行从左到右"
+        "逐格判断。边界格按格子中心点是否落在目标内判断；不要整行照抄上一行，"
+        "也不要跳行。\n\n"
+        "只输出 JSON（不要 markdown、不要解释）：\n"
+        '{"rows": ["..", "..", ...]}\n'
+        f"rows 共 {gh} 个字符串，每个长度恰好 {gw}，仅含字符 '0' 或 '1'："
+        "'1' = 该格属于目标，'0' = 不属于。\n"
+        "画面中没有目标时输出全 '0'。"
+    )
+    return [{"role": "user", "content": [
+        {"type": "text", "text": prompt},
+        {"type": "image_url", "image_url": {"url": data_url}},
+    ]}]
+
+
+def segment_ai(rgb8: np.ndarray, target: str, config: dict | None = None,
+               timeout: int = 180) -> dict:
+    """AI 网格分割：返回 {target, grid, width, height, model}。
+
+    grid 是 ['0101...', ...]（每行 width 个字符、共 height 行），交给
+    MaskState(kind='ai') 后由 core 渲染成软边蒙版。
+    画面中未识别到目标时抛 ValueError（区别于网络/模型错误的 RuntimeError）。
+    """
+    cfg = resolve_config(config)
+    if cfg is None:
+        raise _no_config_error()
+    base, key, model = cfg
+    gw, gh = _seg_grid_dims(rgb8)
+    messages = _build_seg_messages(rgb8, target, gw, gh)
+    # 网格本身即输出预算：96×72 ≈ 7k 字符，再留 JSON 结构与说明余量
+    max_tokens = min(16000, gw * gh * 2 + 1024)
+    try:
+        text = _chat(base, key, model, messages, timeout=timeout,
+                     max_tokens=max_tokens, temperature=0.1)
+        raw = _extract_json(text)
+        rows = _parse_grid(raw, gw, gh)
+    except ValueError as exc:
+        raise RuntimeError(f"{model}: {exc}") from exc
+    rows = _cleanup_grid(rows)
+    label = AI_MASK_TARGETS[target][0]
+    if core.grid_to_array(rows, gw, gh).max() < 0.5:
+        raise ValueError(f"画面中未识别到「{label}」")
+    return {"target": target, "grid": rows, "width": gw, "height": gh,
+            "model": f"{model}@{base}"}

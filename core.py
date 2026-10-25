@@ -171,13 +171,13 @@ class MaskAdjustments:
 
 @dataclass
 class MaskState:
-    """一个局部蒙版：linear(线性渐变) / radial(径向渐变) / brush(画笔)。
+    """一个局部蒙版：linear(线性渐变) / radial(径向渐变) / brush(画笔) / ai(AI 识别)。
 
     几何坐标全部归一化到 0..1（相对图像宽高），便于缩放与传输；
     feather / size 为 0..100 的 UI 档位，渲染时换算成像素。
     """
 
-    kind: str = "linear"                 # 'linear' | 'radial' | 'brush'
+    kind: str = "linear"                 # 'linear' | 'radial' | 'brush' | 'ai'
     name: str = ""
     enabled: bool = True
     invert: bool = False                 # 反向：作用于蒙版之外
@@ -199,6 +199,18 @@ class MaskState:
     # 画笔：笔刷大小 + 笔画（每段笔画是 [(x, y), ...] 归一化点序列）
     size: float = 12.0                   # 1..100
     strokes: list = field(default_factory=list)
+
+    # AI 蒙版：识别目标（subject/person/background/sky）+ 掩码数据（两种形态）。
+    # ① grid：'0'/'1' 字符行 + 尺寸（视觉大模型网格分割，粗边界）
+    # ② mask_png：单通道 8bit PNG 的 base64（本地分割模型，像素级软边界）
+    # mask_png 非空时优先渲染；两者都以归一化坐标覆盖整幅图像。
+    ai_target: str = ""
+    grid: list = field(default_factory=list)
+    grid_w: int = 0
+    grid_h: int = 0
+    mask_png: str = ""
+    mask_w: int = 0
+    mask_h: int = 0
 
     adj: MaskAdjustments = field(default_factory=MaskAdjustments)
 
@@ -1083,6 +1095,85 @@ def _brush_mask(m: "MaskState", shape) -> np.ndarray:
     return np.clip(canvas, 0.0, 1.0)
 
 
+def grid_to_array(rows, gw: int, gh: int) -> np.ndarray:
+    """['0101...', ...] -> (gh, gw) float32 0/1 数组；非法输入安全降级。
+
+    只认 '1' 字符，其余（杂散字符/补位）一律为 0。
+    """
+    gw, gh = int(gw), int(gh)
+    if gw <= 0 or gh <= 0 or not rows:
+        return np.zeros((max(gh, 0), max(gw, 0)), np.float32)
+    data = "".join(
+        "".join(ch for ch in str(r) if ch in "01")[:gw].ljust(gw, "0")
+        for r in list(rows)[:gh])
+    data = data.ljust(gw * gh, "0")[:gw * gh]
+    arr = np.frombuffer(data.encode("ascii"), np.uint8)
+    return (arr == ord("1")).astype(np.float32).reshape(gh, gw)
+
+
+def array_to_grid(arr: np.ndarray) -> list:
+    """(H,W) 0/1 数组 -> ['0101...', ...] 字符串行。"""
+    if arr.size == 0:
+        return []
+    return ["".join("1" if v >= 0.5 else "0" for v in row)
+            for row in np.asarray(arr >= 0.5)]
+
+
+def encode_mask_png(arr: np.ndarray) -> tuple:
+    """(H,W) float 0..1 掩码 -> (base64 PNG 字符串, w, h)；保留 256 级软边界。"""
+    import base64
+    h, w = arr.shape[:2]
+    u8 = np.clip(np.asarray(arr, np.float32) * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    ok, buf = cv2.imencode(".png", u8)
+    if not ok:
+        return "", 0, 0
+    return base64.b64encode(buf.tobytes()).decode("ascii"), int(w), int(h)
+
+
+def decode_mask_png(b64: str) -> np.ndarray:
+    """base64 单通道 PNG -> (H,W) float 0..1；失败返回空数组。"""
+    import base64
+    if not b64:
+        return np.zeros((0, 0), np.float32)
+    try:
+        data = np.frombuffer(base64.b64decode(b64), np.uint8)
+        u8 = cv2.imdecode(data, cv2.IMREAD_GRAYSCALE)
+    except Exception:
+        return np.zeros((0, 0), np.float32)
+    if u8 is None:
+        return np.zeros((0, 0), np.float32)
+    return u8.astype(np.float32) / np.float32(255.0)
+
+
+def _ai_mask(m: "MaskState", shape) -> np.ndarray:
+    """AI 蒙版：mask_png（像素级，优先）或 0/1 网格放大到整幅，再按羽化柔化。
+
+    与画笔同一套柔化方案（先 1/8 降采样模糊再上采样），边缘平滑且开销有界；
+    像素级掩码自带 256 级软边界，羽化在其上进一步柔化（feather=0 保留原样）。
+    """
+    h, w = shape
+    if m.mask_png:
+        fine = decode_mask_png(m.mask_png)
+        if fine.size:
+            mask = cv2.resize(fine, (w, h), interpolation=cv2.INTER_LINEAR)
+        else:
+            mask = np.zeros((h, w), np.float32)
+    else:
+        cells = grid_to_array(m.grid, m.grid_w, m.grid_h)
+        if cells.size == 0:
+            return np.zeros((h, w), np.float32)
+        mask = cv2.resize(cells, (w, h), interpolation=cv2.INTER_LINEAR)
+    short = max(min(w, h), 1)
+    fpx = min(m.feather / 100.0 * short * 0.15, 160.0)
+    if fpx > 0.6 and float(mask.max()) > 0.0:
+        s = 8
+        sh, sw = max(1, h // s), max(1, w // s)
+        small = cv2.resize(mask, (sw, sh), interpolation=cv2.INTER_AREA)
+        small = cv2.GaussianBlur(small, (0, 0), sigmaX=max(fpx / s, 0.5))
+        mask = cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
+    return np.clip(mask, 0.0, 1.0)
+
+
 def render_mask(m: "MaskState", shape, max_edge: int | None = None) -> np.ndarray:
     """渲染蒙版为 (H,W) float32 0..1（已处理反向）。
 
@@ -1102,6 +1193,8 @@ def render_mask(m: "MaskState", shape, max_edge: int | None = None) -> np.ndarra
         mask = _linear_mask(m, shape)
     elif m.kind == "radial":
         mask = _radial_mask(m, shape)
+    elif m.kind == "ai":
+        mask = _ai_mask(m, shape)
     else:
         mask = _brush_mask(m, shape)
     if mask.shape[:2] != (h, w):
@@ -1117,6 +1210,10 @@ class MaskRenderer:
     思路与 LowResRenderer 一致：先在低分辨率（默认最长边 768）渲染，再一次性
     上采样到全尺寸，之后按行区间切片返回。这样每个分块拿到的蒙版与整图处理
     完全一致（逐位相同），既没有接缝，也不需要 halo。
+
+    低分辨率结果走跨任务 LRU（_render_mask_cached）：拖动滑块/改参数时每个
+    渲染任务都会重建 MaskRenderer，而蒙版几何未变——重复渲染纯属浪费。
+    蒙版只依赖几何与形状（与图像像素无关），缓存天然跨图安全。
     """
 
     COARSE_EDGE = 768
@@ -1135,10 +1232,10 @@ class MaskRenderer:
                 continue
             s = min(1.0, self.COARSE_EDGE / float(max(h, w)))
             if s < 1.0:
-                self._coarse.append(render_mask(m, (max(1, int(h * s)),
-                                                    max(1, int(w * s)))))
+                self._coarse.append(_render_mask_cached(m, (max(1, int(h * s)),
+                                                            max(1, int(w * s)))))
             else:
-                self._coarse.append(render_mask(m, (h, w)))
+                self._coarse.append(_render_mask_cached(m, (h, w)))
             self._full.append(None)
 
     def get(self, index: int, y0: int, y1: int, width: int) -> np.ndarray:
@@ -1169,8 +1266,53 @@ def mask_cache_key(m: "MaskState", shape) -> tuple:
     if m.kind == "radial":
         return base + (round(m.cx, 5), round(m.cy, 5), round(m.radius, 5),
                        round(m.aspect, 5), round(m.angle, 4))
+    if m.kind == "ai":
+        # 掩码内容决定渲染结果；ai_target 只是语义标签，不影响像素
+        return base + (int(m.grid_w), int(m.grid_h), tuple(m.grid),
+                       hash(m.mask_png) if m.mask_png else 0)
     strokes = tuple(tuple((round(x, 5), round(y, 5)) for x, y in s) for s in m.strokes)
     return base + (round(m.size, 4), strokes)
+
+
+# ---- 蒙版渲染跨任务 LRU ------------------------------------------------
+# 每条缓存 ≈ 768×576×4B ≈ 1.7MB；12 条足够单图常用蒙版集合。
+_MASK_CACHE_MAX = 12
+_mask_cache: dict = {}
+_mask_cache_order: list = []
+_mask_cache_lock = threading.Lock()
+mask_cache_stats = {"hit": 0, "miss": 0}
+
+
+def _render_mask_cached(m: "MaskState", shape) -> np.ndarray:
+    """render_mask 的 LRU 版本：蒙版几何未变时直接复用上一次的渲染结果。
+
+    渲染在锁外执行（避免长持锁），写入时再查重（并发下最多多算一次，无害）。
+    返回的是共享数组，调用方只读、不得原地修改（MaskRenderer.get 上采样即拷贝）。
+    """
+    key = mask_cache_key(m, shape)
+    with _mask_cache_lock:
+        ent = _mask_cache.get(key)
+        if ent is not None:
+            _mask_cache_order.remove(key)
+            _mask_cache_order.append(key)
+            mask_cache_stats["hit"] += 1
+            return ent
+    arr = render_mask(m, shape)
+    with _mask_cache_lock:
+        if key not in _mask_cache:
+            _mask_cache[key] = arr
+            _mask_cache_order.append(key)
+            while len(_mask_cache_order) > _MASK_CACHE_MAX:
+                _mask_cache.pop(_mask_cache_order.pop(0), None)
+        mask_cache_stats["miss"] += 1
+    return _mask_cache[key]
+
+
+def clear_mask_cache() -> None:
+    """清空蒙版缓存（测试隔离用）。"""
+    with _mask_cache_lock:
+        _mask_cache.clear()
+        _mask_cache_order.clear()
 
 
 def apply_masked_adjustments(img: np.ndarray, masks, renderer: "MaskRenderer | None" = None,
@@ -1384,6 +1526,78 @@ def fit_rect_in_rotation(rect, shape, angle_deg: float,
     return (max(0, ix0), max(0, iy0), min(w, ix1), min(h, iy1))
 
 
+def _remap_ai_grid(m: "MaskState", map_point) -> None:
+    """几何变换后同步 AI 网格（原地重写 m.grid）。
+
+    前向重采样：旧格中心经 map_point 落到新网格取 max（裁剪/旋转是刚体
+    变换，粗网格下与逆采样等价；新图必然是旧图的子区域，覆盖完整）。
+    """
+    cells = grid_to_array(m.grid, m.grid_w, m.grid_h)
+    gh, gw = cells.shape
+    if gh == 0 or gw == 0:
+        return
+    out = np.zeros((gh, gw), np.float32)
+    for j in range(gh):
+        ny = (j + 0.5) / gh
+        for i in range(gw):
+            if cells[j, i] < 0.5:
+                continue
+            mx, my = map_point((i + 0.5) / gw, ny)
+            if not (0.0 <= mx < 1.0 and 0.0 <= my < 1.0):
+                continue
+            jj = min(int(my * gh), gh - 1)
+            ii = min(int(mx * gw), gw - 1)
+            out[jj, ii] = 1.0
+    m.grid = array_to_grid(out)
+
+
+def _fit_affine(map_point) -> tuple:
+    """从 map_point 采样 4 点最小二乘拟合仿射（旧归一化 -> 新归一化）。
+
+    裁剪/拉直/90° 旋转的映射均为仿射；返回 2x3 矩阵，失败返回 None。
+    """
+    src = np.array([[0.25, 0.25], [0.75, 0.25], [0.25, 0.75], [0.75, 0.75]],
+                   np.float32)
+    dst = np.array([map_point(x, y) for x, y in src], np.float32)
+    A = np.concatenate([src, np.ones((4, 1), np.float32)], axis=1)   # (4,3)
+    try:
+        coef, *_ = np.linalg.lstsq(A, dst, rcond=None)               # (3,2)
+    except np.linalg.LinAlgError:
+        return None
+    return coef.T                                                    # (2,3) [a b c; d e f]
+
+
+def _remap_ai_mask_png(m: "MaskState", map_point) -> None:
+    """几何变换后同步像素级 AI 掩码（原地重写 m.mask_png）。
+
+    与网格的前向重采样不同：像素掩码用逆映射重采样——数值拟合 map_point
+    的仿射矩阵求逆，对新掩码每个像素查旧掩码坐标（cv2.remap），保留
+    256 级软边界且无洞。
+    """
+    fine = decode_mask_png(m.mask_png)
+    h, w = fine.shape[:2]
+    if h == 0 or w == 0:
+        return
+    M = _fit_affine(map_point)                     # 旧坐标 = M · [新坐标; 1] 的逆？
+    if M is None:
+        return
+    Minv = np.linalg.inv(
+        np.concatenate([M, [[0.0, 0.0, 1.0]]], axis=0))             # 新 -> 旧
+    xs = (np.arange(w, dtype=np.float32) + 0.5) / w
+    ys = (np.arange(h, dtype=np.float32) + 0.5) / h
+    nx, ny = np.meshgrid(xs, ys)
+    ox = Minv[0, 0] * nx + Minv[0, 1] * ny + Minv[0, 2]
+    oy = Minv[1, 0] * nx + Minv[1, 1] * ny + Minv[1, 2]
+    map_x = ox * w - 0.5
+    map_y = oy * h - 0.5
+    out = cv2.remap(fine, map_x.astype(np.float32), map_y.astype(np.float32),
+                    interpolation=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_CONSTANT, borderValue=0.0)
+    b64, pw, ph = encode_mask_png(out)
+    if b64:
+        m.mask_png, m.mask_w, m.mask_h = b64, pw, ph
+
+
 def remap_mask_geometry(masks, map_point, old_shape, new_shape,
                         angle_delta: float = 0.0) -> None:
     """几何变换后同步蒙版坐标（原地修改蒙版列表）。
@@ -1391,7 +1605,8 @@ def remap_mask_geometry(masks, map_point, old_shape, new_shape,
     map_point: (nx, ny) -> (nx', ny')，旧图归一化坐标 -> 新图归一化坐标；
     径向蒙版角度加 angle_delta（屏幕顺时针为正，与 MaskState.angle 同约定；
     刚体变换下椭圆主轴长度不变，故 aspect 无需改动）；
-    半径 / 笔刷大小按两图短边像素比缩放，保持物理尺寸不变。
+    半径 / 笔刷大小按两图短边像素比缩放，保持物理尺寸不变；
+    AI 蒙版的网格按同一映射前向重采样。
     """
     short_old = min(old_shape[0], old_shape[1])
     short_new = max(min(new_shape[0], new_shape[1]), 1)
@@ -1404,6 +1619,9 @@ def remap_mask_geometry(masks, map_point, old_shape, new_shape,
             m.cx, m.cy = map_point(m.cx, m.cy)
             m.radius = float(np.clip(m.radius * ratio, 0.01, 5.0))
             m.angle = (float(m.angle) + angle_delta) % 360.0
+        elif m.kind == "ai":
+            _remap_ai_grid(m, map_point)
+            _remap_ai_mask_png(m, map_point)
         else:
             m.strokes = [[tuple(map_point(x, y)) for x, y in s]
                          for s in m.strokes]

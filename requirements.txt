@@ -2,6 +2,12 @@ PySide6>=6.6,<7
 numpy>=1.26,<3
 opencv-python>=4.9,<6
 
+# Web 服务端（server.py，新版 Web UI 的后端）
+fastapi>=0.110
+uvicorn[standard]>=0.29
+
 # 以下为可选依赖（run.bat 会自动尝试安装，失败不影响基本功能）：
-# rawpy     - RAW 解码（DNG/CR2/CR3/NEF/ARW 等）
-# pyopencl  - GPU 加速（需显卡驱动自带 OpenCL：NVIDIA / AMD / Intel 均可）
+# rawpy       - RAW 解码（DNG/CR2/CR3/NEF/ARW 等）
+# pyopencl    - GPU 加速（需显卡驱动自带 OpenCL：NVIDIA / AMD / Intel 均可）
+# httpx       - 仅 tests_server.py 需要（fastapi.testclient）
+# pyinstaller - 仅桌面版打包 sidecar 需要（build/photolab-server.spec）

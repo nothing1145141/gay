@@ -3,6 +3,9 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# Frontend (Web UI)
+frontend/node_modules/
+
 # C extensions
 *.so
 
@@ -218,3 +221,14 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Electron 桌面版
+desktop/node_modules/
+desktop/release/
+backend-dist/
+
+# PyInstaller 工作目录
+build/pyinstaller-work/
+
+# 本地分割模型权重（~575MB，不入库；package.bat 打包时本地注入）
+models/

@@ -1490,14 +1490,12 @@ class MainWindow(QMainWindow):
         serial = self._source_serial
 
         def work():
-            # 端点发现含网络请求（每个供应商最多 8s），必须放在后台线程，避免冻结 GUI
             try:
                 if not auto.resolve_candidates():
                     self.aiError.emit(
-                        "未找到可用的 AI 端点。\n\n"
-                        "可设置环境变量 PHOTOLAB_AI_BASE_URL / PHOTOLAB_AI_KEY / "
-                        "PHOTOLAB_AI_MODEL\n（OpenAI 兼容接口 + 视觉模型），"
-                        "或在本机 ZCode 中配置供应商后自动发现。")
+                        "未配置 AI 模型。\n\n"
+                        "请设置环境变量 PHOTOLAB_AI_BASE_URL / PHOTOLAB_AI_KEY / "
+                        "PHOTOLAB_AI_MODEL\n（OpenAI 兼容接口 + 视觉模型）。")
                     return
                 params, note, desc = auto.suggest_ai(src)
             except Exception as exc:
