@@ -57,7 +57,7 @@ function onWheelChange(range: GradingRange, displayHue: number, displaySat: numb
   text-align: center;
   font-size: 11px;
   font-weight: 600;
-  color: #9a9aa4;
+  color: #9a9a9a;
   margin-bottom: 4px;
   user-select: none;
 }

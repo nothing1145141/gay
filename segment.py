@@ -16,6 +16,7 @@ MaskState.mask_png，由 core._ai_mask 渲染（羽化/反向/局部调整全部
 from __future__ import annotations
 
 import os
+import sys
 import threading
 import urllib.request
 
@@ -39,7 +40,18 @@ MODELS: dict = {
                 "salim4n/yolov8n-detect-onnx/resolve/main/yolov8n-onnx-web/yolov8n.onnx"),
 }
 
-MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+def _models_dir() -> str:
+    if getattr(sys, "frozen", False):
+        # PyInstaller：内置 models 落在 _MEIPASS/models，优先使用
+        bundled = os.path.join(getattr(sys, "_MEIPASS", ""), "models")
+        if os.path.isdir(bundled):
+            return bundled
+        # 未内置模型：落到 exe 同级可写目录，供 hf-mirror 按需下载（结果可持久保存）
+        return os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "models")
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+
+
+MODELS_DIR = _models_dir()
 _MIRROR = "https://hf-mirror.com/"
 
 # 掩码输出分辨率（最长边；归一化存储，渲染时放大）

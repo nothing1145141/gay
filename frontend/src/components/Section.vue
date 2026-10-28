@@ -1,5 +1,5 @@
 <script setup lang="ts">
-/** 可折叠分区（对照旧 CollapsibleSection）。 */
+/** LR 风格可折叠面板：标题条 + 右侧三角，标题大写小字距。 */
 import { ref } from 'vue'
 
 const props = withDefaults(defineProps<{ title: string; expanded?: boolean }>(), { expanded: true })
@@ -10,9 +10,9 @@ function toggle(): void { open.value = !open.value }
 
 <template>
   <div class="section">
-    <div class="section-head" @click="toggle">
-      <span>{{ title }}</span>
-      <span class="arrow" :class="{ open }">▾</span>
+    <div class="section-head" :class="{ open }" @click="toggle">
+      <span class="title">{{ title }}</span>
+      <span class="tri">▾</span>
     </div>
     <div v-show="open" class="section-body">
       <slot />
@@ -22,28 +22,35 @@ function toggle(): void { open.value = !open.value }
 
 <style scoped>
 .section {
-  border-bottom: 1px solid #232329;
+  border-bottom: 1px solid var(--border);
 }
 .section-head {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 9px 14px;
-  font-size: 12px;
-  font-weight: 600;
-  letter-spacing: 2px;
-  color: #9a9aa4;
+  padding: 8px 14px;
+  background: var(--bg-surf);
   cursor: pointer;
   user-select: none;
+  transition: background 0.12s;
 }
-.section-head:hover { color: #d8d8de; }
-.arrow {
+.section-head:hover { background: var(--bg-hover); }
+.title {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 1.2px;
+  color: var(--text-2);
+}
+.section-head:hover .title { color: var(--text); }
+.tri {
+  font-size: 9px;
+  color: var(--text-3);
   transition: transform 0.15s;
-  color: #55555e;
 }
-.arrow.open { transform: rotate(0deg); }
-.arrow:not(.open) { transform: rotate(-90deg); }
+.tri.open,
+.section-head.open .tri { transform: rotate(0deg); }
+.section-head:not(.open) .tri { transform: rotate(-90deg); }
 .section-body {
-  padding: 2px 14px 10px;
+  padding: 6px 14px 12px;
 }
 </style>

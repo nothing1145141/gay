@@ -11,14 +11,14 @@ frontend/node_modules/
 
 # Distribution / packaging
 .Python
-build/
+build/*
 develop-eggs/
 dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
+/lib/
+/lib64/
 parts/
 sdist/
 var/
@@ -232,3 +232,9 @@ build/pyinstaller-work/
 
 # 本地分割模型权重（~575MB，不入库；package.bat 打包时本地注入）
 models/
+
+# 例外：以下为项目源文件（非 Python 构建产物），需纳入版本控制
+# 以便复现打包（PyInstaller spec / 应用图标 / 前端 TS 逻辑模块）
+!build/photolab-server.spec
+!build/icon.ico
+!frontend/src/lib/

@@ -1,3 +1,37 @@
+/* ============================================================
+   PhotoLab — Lightroom Classic 风格中性灰主题
+   调色板：RGB 三通道均衡的中性灰（无蓝紫偏色），配合 LR 式细滑块、
+   面板标题与精确的小字号排版。
+   ============================================================ */
+:root {
+  /* 表面（由深到浅） */
+  --bg-deep:   #1e1e1e;   /* 应用最底 / 图像外围 */
+  --bg-panel:  #2b2b2b;   /* 主面板、工具栏 */
+  --bg-surf:   #333333;   /* 分区标题、次级面板 */
+  --bg-well:   #242424;   /* 输入框、滑轨、缩略图底 */
+  --bg-hover:  #3a3a3a;   /* 悬停 */
+
+  /* 描边 */
+  --border:    #3d3d3d;   /* 分隔线 */
+  --border-2:  #4a4a4a;   /* 强调描边 */
+
+  /* 文本 */
+  --text:      #d4d4d4;   /* 主文本 */
+  --text-2:    #a2a2a2;   /* 标签 / 次级 */
+  --text-3:    #727272;   /* 弱化 / 提示 */
+
+  /* 强调 */
+  --accent:    #4a9eff;   /* 选中 / 可交互（LR 蓝） */
+  --accent-2:  #3a82d6;   /* 按下 */
+  --danger:    #e06c75;   /* 危险 */
+  --warn:      #d9a441;   /* 处理中 */
+
+  /* 滑块 */
+  --track:     #202020;   /* 滑轨槽 */
+  --track-fill:#8f8f8f;   /* 填充 */
+  --thumb:     #dcdcdc;   /* 滑块钮 */
+}
+
 * { box-sizing: border-box; }
 html, body, #app {
   height: 100%;
@@ -5,12 +39,27 @@ html, body, #app {
   padding: 0;
 }
 body {
-  font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
-  font-size: 13px;
-  background: #101014;
-  color: #d8d8de;
+  font-family: "Segoe UI", "Microsoft YaHei", system-ui, -apple-system, sans-serif;
+  font-size: 12px;
+  background: var(--bg-deep);
+  color: var(--text);
   overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
-::-webkit-scrollbar { width: 8px; height: 8px; }
-::-webkit-scrollbar-thumb { background: #2e2e36; border-radius: 4px; }
+
+/* LR 风格：数值用等宽数字，便于对齐 */
+.num, .value, .sub-val, .s-val {
+  font-variant-numeric: tabular-nums;
+}
+
+/* 细滚动条 */
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-thumb {
+  background: #4a4a4a;
+  border-radius: 5px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover { background: #606060; background-clip: padding-box; border: 2px solid transparent; }
 ::-webkit-scrollbar-track { background: transparent; }

@@ -57,10 +57,10 @@ function draw(): void {
   // 内盘
   ctx.beginPath()
   ctx.arc(c, c, DISC_R, 0, Math.PI * 2)
-  ctx.fillStyle = '#26262a'
+  ctx.fillStyle = '#3a3a3a'
   ctx.fill()
   ctx.lineWidth = 1
-  ctx.strokeStyle = '#3a3a41'
+  ctx.strokeStyle = '#4a4a4a'
   ctx.stroke()
 
   // 拖动点（y 向上：屏幕 y 取 -sin）
@@ -75,7 +75,7 @@ function draw(): void {
   ctx.fillStyle = `rgb(${sr},${sg},${sb})`
   ctx.fill()
   ctx.lineWidth = 1.5
-  ctx.strokeStyle = '#f0f0f5'
+  ctx.strokeStyle = '#ececec'
   ctx.stroke()
 }
 

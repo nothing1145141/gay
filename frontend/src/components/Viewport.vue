@@ -211,7 +211,7 @@ function drawPin(ctx: CanvasRenderingContext2D, index: number, imgPt: { x: numbe
   ctx.beginPath(); ctx.arc(s.x, s.y, 9, 0, Math.PI * 2)
   ctx.fillStyle = 'rgba(23,23,28,0.85)'; ctx.fill()
   ctx.lineWidth = 1.4; ctx.strokeStyle = 'rgba(255,255,255,0.85)'; ctx.stroke()
-  ctx.fillStyle = '#e8e8ec'
+  ctx.fillStyle = '#e2e2e2'
   ctx.font = '10px sans-serif'
   ctx.textAlign = 'center'
   ctx.textBaseline = 'middle'
@@ -258,7 +258,7 @@ function drawMaskOverlay(ctx: CanvasRenderingContext2D, d: { w: number; h: numbe
       ctx.restore()
       for (const c of [g.p1, g.mid, g.p2]) {
         const s = imgToScreen(c.x, c.y)
-        drawHandle(ctx, s.x, s.y, '#e8e8ec')
+        drawHandle(ctx, s.x, s.y, '#e2e2e2')
       }
       // 旋转手柄：终点外侧（橙色，与径向旋转手柄同约定）
       const rh = imgToScreen(g.p2.x + g.u.x * 26 / z, g.p2.y + g.u.y * 26 / z)
@@ -267,7 +267,7 @@ function drawMaskOverlay(ctx: CanvasRenderingContext2D, d: { w: number; h: numbe
       if (!showOverlay) { drawPin(ctx, i, maskPinPoint(m, d)); continue }
       const g = radialGeom(m, d)
       const c = imgToScreen(g.cx, g.cy)
-      ctx.strokeStyle = '#e8e8ec'
+      ctx.strokeStyle = '#e2e2e2'
       ctx.lineWidth = 1.6
       ctx.beginPath()
       ctx.ellipse(c.x, c.y, g.rx * z, g.ry * z, g.angRad, 0, Math.PI * 2)
@@ -276,7 +276,7 @@ function drawMaskOverlay(ctx: CanvasRenderingContext2D, d: { w: number; h: numbe
       const longP = { x: c.x + dirX * g.rx * z, y: c.y + dirY * g.rx * z }
       const shortP = { x: c.x - dirY * g.ry * z, y: c.y + dirX * g.ry * z }
       const rotP = { x: c.x + dirX * (g.rx * z + 22), y: c.y + dirY * (g.rx * z + 22) }
-      drawHandle(ctx, c.x, c.y, '#e8e8ec')
+      drawHandle(ctx, c.x, c.y, '#e2e2e2')
       drawHandle(ctx, longP.x, longP.y, '#4a9eff')
       drawHandle(ctx, shortP.x, shortP.y, '#4a9eff')
       drawHandle(ctx, rotP.x, rotP.y, '#f0a030')
@@ -359,10 +359,10 @@ function drawCropOverlay(ctx: CanvasRenderingContext2D, d: { w: number; h: numbe
     ctx.beginPath(); ctx.moveTo(gx, a.y); ctx.lineTo(gx, b.y); ctx.stroke()
     ctx.beginPath(); ctx.moveTo(a.x, gy); ctx.lineTo(b.x, gy); ctx.stroke()
   }
-  ctx.strokeStyle = '#e8e8ec'
+  ctx.strokeStyle = '#e2e2e2'
   ctx.lineWidth = 1.6
   ctx.strokeRect(a.x, a.y, b.x - a.x, b.y - a.y)
-  ctx.fillStyle = '#e8e8ec'
+  ctx.fillStyle = '#e2e2e2'
   for (const [hx, hy] of [[a.x, a.y], [b.x, a.y], [a.x, b.y], [b.x, b.y]] as const) {
     ctx.fillRect(hx - 4, hy - 4, 8, 8)
   }
@@ -428,7 +428,7 @@ function redraw(): void {
   }
   const ctx = cv.getContext('2d')!
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
-  ctx.fillStyle = '#0d0d10'
+  ctx.fillStyle = '#1a1a1a'
   ctx.fillRect(0, 0, cw, ch)
   const d = displayFrame()
   if (!d) return
@@ -463,7 +463,7 @@ function redraw(): void {
       ctx.moveTo(cxm, cym - 7); ctx.lineTo(cxm, cym + 7); ctx.stroke()
     }
     if (dstRectPreview) {
-      ctx.strokeStyle = '#e8e8ec'
+      ctx.strokeStyle = '#e2e2e2'
       ctx.lineWidth = 1.4
       ctx.strokeRect(
         Math.min(dstRectPreview.a.x, dstRectPreview.b.x),
@@ -881,7 +881,7 @@ const cursorClass = computed(() => {
   width: 100%;
   height: 100%;
   overflow: hidden;
-  background: #0d0d10;
+  background: #1a1a1a;
 }
 canvas {
   position: absolute;
@@ -900,7 +900,7 @@ canvas {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  color: #7c7c86;
+  color: #787878;
   user-select: none;
   pointer-events: none;
 }

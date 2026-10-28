@@ -57,7 +57,7 @@ watch(() => props.hist, redraw, { deep: false })
   width: 100%;
   height: 88px;
   display: block;
-  background: #0d0d10;
+  background: #1a1a1a;
   border-radius: 4px;
 }
 </style>

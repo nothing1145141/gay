@@ -179,40 +179,40 @@ function onSave(): void {
 <style scoped>
 .ai-settings {
   width: min(480px, 92vw);
-  background: #1d1d23;
-  border: 1px solid #2a2a31;
+  background: #262626;
+  border: 1px solid #424242;
   border-radius: 8px;
   padding: 16px 18px;
 }
-h3 { margin: 0 0 6px; font-size: 14px; color: #e8e8ec; }
-.desc { margin: 0 0 12px; font-size: 11px; color: #7c7c86; line-height: 1.6; }
+h3 { margin: 0 0 6px; font-size: 14px; color: #e2e2e2; }
+.desc { margin: 0 0 12px; font-size: 11px; color: #787878; line-height: 1.6; }
 .field { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
-.f-label { width: 56px; flex: none; font-size: 12px; color: #b9b9c0; }
+.f-label { width: 56px; flex: none; font-size: 12px; color: #a6a6a6; }
 .field :deep(.n-input), .field :deep(.n-auto-complete) { flex: 1; }
-.test-msg { min-height: 16px; margin: 2px 0 10px; font-size: 11px; color: #7c7c86; }
+.test-msg { min-height: 16px; margin: 2px 0 10px; font-size: 11px; color: #787878; }
 .test-msg.ok { color: #4dd07a; }
-.test-msg.bad { color: #ff6b6b; }
+.test-msg.bad { color: #e06c75; }
 .local-engine {
-  border: 1px dashed #2f3a4d;
+  border: 1px dashed #484848;
   border-radius: 6px;
   padding: 8px 10px;
   margin-bottom: 10px;
 }
 .le-title { font-size: 12px; color: #4a9eff; margin-bottom: 4px; }
 .le-ok { color: #4dd07a; font-size: 11px; margin-left: 6px; }
-.le-desc { margin: 0 0 6px; font-size: 11px; color: #7c7c86; }
-.le-model { display: flex; align-items: center; gap: 6px; font-size: 11px; color: #b9b9c0; padding: 1px 0; }
-.le-dot { width: 7px; height: 7px; border-radius: 50%; background: #55555e; flex: none; }
+.le-desc { margin: 0 0 6px; font-size: 11px; color: #787878; }
+.le-model { display: flex; align-items: center; gap: 6px; font-size: 11px; color: #a6a6a6; padding: 1px 0; }
+.le-dot { width: 7px; height: 7px; border-radius: 50%; background: #5c5c5c; flex: none; }
 .le-dot.ok { background: #4dd07a; }
 .le-name { flex: 1; }
-.le-size { color: #6d6d76; }
-.le-warn { font-size: 11px; color: #e8c268; margin: 4px 0 0; }
+.le-size { color: #6e6e6e; }
+.le-warn { font-size: 11px; color: #d9a441; margin: 4px 0 0; }
 .le-actions { margin-top: 6px; }
 .le-progress { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
-.le-progress .bar { flex: 1; height: 6px; border-radius: 3px; background: #2a2a31; overflow: hidden; }
+.le-progress .bar { flex: 1; height: 6px; border-radius: 3px; background: #424242; overflow: hidden; }
 .le-progress .fill { height: 100%; background: #4a9eff; transition: width 0.3s; }
-.le-progress .pct { font-size: 11px; color: #e8e8ec; width: 34px; text-align: right; }
-.le-progress .cur { font-size: 10px; color: #6d6d76; max-width: 140px; overflow: hidden;
+.le-progress .pct { font-size: 11px; color: #e2e2e2; width: 34px; text-align: right; }
+.le-progress .cur { font-size: 10px; color: #6e6e6e; max-width: 140px; overflow: hidden;
                     text-overflow: ellipsis; white-space: nowrap; }
 .btns { display: flex; align-items: center; gap: 8px; }
 .spacer { flex: 1; }

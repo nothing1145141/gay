@@ -182,11 +182,22 @@ const themeOverrides = {
   common: {
     primaryColor: '#4a9eff',
     primaryColorHover: '#6cb2ff',
-    primaryColorPressed: '#3a8ae6',
-    bodyColor: '#101014',
-    cardColor: '#17171c',
-    popoverColor: '#1d1d23',
-    borderColor: '#2a2a31',
+    primaryColorPressed: '#3a82d6',
+    bodyColor: '#2b2b2b',
+    cardColor: '#333333',
+    popoverColor: '#2b2b2b',
+    borderColor: '#3d3d3d',
+    textColorBase: '#d4d4d4',
+    textColor1: '#d4d4d4',
+    textColor2: '#a2a2a2',
+    textColor3: '#727272',
+    placeholderColor: '#6a6a6a',
+    hoverColor: 'rgba(255,255,255,0.06)',
+  },
+  Button: {
+    colorSecondary: '#3a3a3a',
+    colorSecondaryHover: '#454545',
+    colorSecondaryPressed: '#303030',
   },
 }
 </script>
@@ -328,45 +339,54 @@ const themeOverrides = {
   display: flex;
   flex-direction: column;
   height: 100vh;
-  background: #101014;
-  color: #d8d8de;
+  background: var(--bg-deep);
+  color: var(--text);
 }
+
+/* ---- 顶栏（LR 模块条风格） ---- */
 .toolbar {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 6px 12px;
-  border-bottom: 1px solid #232329;
-  background: #141419;
+  padding: 0 14px;
+  height: 42px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-panel);
   flex-wrap: wrap;
 }
 .brand {
-  font-weight: 700;
-  letter-spacing: 3px;
-  color: #4a9eff;
-  margin-right: 8px;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  color: var(--text);
+  margin-right: 14px;
   user-select: none;
 }
+.brand::first-letter { color: var(--accent); }
 .toolbar-sep {
   width: 1px;
-  height: 18px;
-  background: #2a2a31;
-  margin: 0 4px;
+  height: 20px;
+  background: var(--border);
+  margin: 0 6px;
 }
-.bw-label { font-size: 12px; color: #9a9aa4; }
+.bw-label { font-size: 11px; color: var(--text-2); }
 .spacer { flex: 1; }
-.busy { font-size: 12px; color: #e8c268; }
+.busy { font-size: 11px; color: var(--warn); }
+
+/* ---- 子条（裁剪 / 图章） ---- */
 .subbar {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 5px 12px;
-  border-bottom: 1px solid #232329;
-  background: #18181e;
+  gap: 12px;
+  padding: 6px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-surf);
 }
-.sub-label { font-size: 12px; color: #9a9aa4; }
-.sub-val { font-size: 12px; color: #e8e8ec; font-variant-numeric: tabular-nums; min-width: 44px; }
-.sub-hint { font-size: 11px; color: #6d6d76; margin-left: auto; }
+.sub-label { font-size: 11px; color: var(--text-2); }
+.sub-val { font-size: 11px; color: var(--text); font-variant-numeric: tabular-nums; min-width: 44px; }
+.sub-hint { font-size: 10px; color: var(--text-3); margin-left: auto; }
+
+/* ---- 主体：左视口 + 右调整面板 ---- */
 .main {
   flex: 1;
   display: flex;
@@ -380,21 +400,24 @@ const themeOverrides = {
 }
 .viewport-col > :first-child { flex: 1; min-height: 0; }
 .panel {
-  width: 320px;
+  width: 312px;
   overflow-y: auto;
-  border-left: 1px solid #232329;
-  background: #17171c;
+  border-left: 1px solid var(--border);
+  background: var(--bg-panel);
 }
+
+/* ---- 状态栏 ---- */
 .statusbar {
   display: flex;
   gap: 16px;
   align-items: center;
-  padding: 4px 12px;
-  border-top: 1px solid #232329;
-  background: #141419;
-  font-size: 12px;
-  color: #9a9aa4;
+  padding: 4px 14px;
+  height: 26px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-panel);
+  font-size: 11px;
+  color: var(--text-2);
 }
-.dim { color: #55555e; }
-.status { color: #c8c8ce; }
+.dim { color: var(--text-3); }
+.status { color: var(--text); }
 </style>

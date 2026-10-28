@@ -107,11 +107,11 @@ function redraw(): void {
   const ctx = cv.getContext('2d')!
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
   const r = plotRect()
-  ctx.fillStyle = '#121214'
+  ctx.fillStyle = '#202020'
   ctx.fillRect(0, 0, el.clientWidth, el.clientHeight)
 
   // 网格
-  ctx.strokeStyle = '#26262c'
+  ctx.strokeStyle = '#3a3a3a'
   ctx.lineWidth = 1
   for (let i = 1; i <= 3; i++) {
     const x = r.left + r.w * i / 4
@@ -120,7 +120,7 @@ function redraw(): void {
     ctx.beginPath(); ctx.moveTo(r.left, y); ctx.lineTo(r.left + r.w, y); ctx.stroke()
   }
   // 虚线对角线
-  ctx.strokeStyle = '#3a3a42'
+  ctx.strokeStyle = '#4a4a4a'
   ctx.setLineDash([4, 4])
   const [dx0, dy0] = toWidget(0.02, 0.02)
   const [dx1, dy1] = toWidget(0.98, 0.98)
@@ -150,7 +150,7 @@ function redraw(): void {
     const sel = i === selected || i === dragIndex
     ctx.beginPath()
     ctx.arc(px, py, sel ? 5.5 : 4.2, 0, Math.PI * 2)
-    ctx.fillStyle = sel ? '#e8e8ec' : '#1c1c20'
+    ctx.fillStyle = sel ? '#e2e2e2' : '#242424'
     ctx.fill()
     ctx.strokeStyle = sel ? '#4a9eff' : CURVE_CHANNEL_COLORS[channel.value]
     ctx.lineWidth = 1.5
@@ -297,23 +297,23 @@ function resetChannel(): void {
 .ch-tab {
   border: 1px solid transparent;
   background: transparent;
-  color: #8a8a94;
+  color: #868686;
   font-size: 12px;
   padding: 2px 8px;
   border-radius: 4px;
   cursor: pointer;
 }
 .ch-tab.active {
-  border-color: #2f2f38;
-  background: #1d1d23;
-  color: #e8e8ec;
+  border-color: #484848;
+  background: #262626;
+  color: #e2e2e2;
 }
-.ch-tab:hover { color: #d8d8de; }
+.ch-tab:hover { color: #d2d2d2; }
 .ch-reset {
   margin-left: auto;
   border: 0;
   background: transparent;
-  color: #6d6d76;
+  color: #6e6e6e;
   cursor: pointer;
   font-size: 12px;
 }

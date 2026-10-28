@@ -28,8 +28,8 @@ const store = useEditor()
   display: flex;
   gap: 6px;
   padding: 6px 10px;
-  border-top: 1px solid #232329;
-  background: #141419;
+  border-top: 1px solid #3a3a3a;
+  background: #262626;
   overflow-x: auto;
   overflow-y: hidden;
   flex: none;
@@ -39,16 +39,16 @@ const store = useEditor()
   flex: none;
   width: 78px;
   height: 58px;
-  border: 1px solid #2a2a31;
+  border: 1px solid #424242;
   border-radius: 4px;
-  background: #0d0d10;
+  background: #1a1a1a;
   cursor: pointer;
   overflow: hidden;
   display: flex;
   align-items: center;
   justify-content: center;
 }
-.cell:hover { border-color: #55555e; }
+.cell:hover { border-color: #5c5c5c; }
 .cell.current { border-color: #4a9eff; box-shadow: 0 0 0 1px #4a9eff; }
 .cell img {
   max-width: 100%;
@@ -61,7 +61,7 @@ const store = useEditor()
   left: 0; right: 0; bottom: 0;
   font-size: 9px;
   line-height: 14px;
-  color: #d8d8de;
+  color: #d2d2d2;
   background: rgba(13, 13, 16, 0.72);
   white-space: nowrap;
   overflow: hidden;
@@ -76,7 +76,7 @@ const store = useEditor()
   border: none;
   border-radius: 3px;
   background: rgba(13, 13, 16, 0.72);
-  color: #9a9aa4;
+  color: #9a9a9a;
   font-size: 10px;
   line-height: 16px;
   padding: 0;
@@ -84,5 +84,5 @@ const store = useEditor()
   opacity: 0;
 }
 .cell:hover .del { opacity: 1; }
-.del:hover { color: #ff6b6b; }
+.del:hover { color: #e06c75; }
 </style>

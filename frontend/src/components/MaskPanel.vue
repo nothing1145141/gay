@@ -149,14 +149,14 @@ function setGeom(i: number, field: 'feather' | 'size' | 'radius' | 'aspect' | 'a
 
 <style scoped>
 .mask-panel { display: flex; flex-direction: column; gap: 8px; }
-.ai-group { border: 1px dashed #2f3a4d; border-radius: 6px; padding: 6px 8px; }
+.ai-group { border: 1px dashed #484848; border-radius: 6px; padding: 6px 8px; }
 .ai-title { font-size: 11px; color: #4a9eff; margin-bottom: 5px; }
 .ai-actions { display: flex; gap: 6px; }
 .ai-add {
   flex: 1;
-  border: 1px solid #2f2f38;
-  background: #1d1d23;
-  color: #d8d8de;
+  border: 1px solid #484848;
+  background: #262626;
+  color: #d2d2d2;
   font-size: 12px;
   padding: 4px 0;
   border-radius: 4px;
@@ -165,46 +165,46 @@ function setGeom(i: number, field: 'feather' | 'size' | 'radius' | 'aspect' | 'a
 }
 .ai-add:hover:not(:disabled) { border-color: #4a9eff; color: #4a9eff; }
 .ai-add:disabled { opacity: 0.45; cursor: default; }
-.ai-hint { font-size: 10px; color: #55555e; margin-top: 5px; }
+.ai-hint { font-size: 10px; color: #5c5c5c; margin-top: 5px; }
 .actions { display: flex; gap: 6px; }
 .add {
   flex: 1;
-  border: 1px solid #2f2f38;
-  background: #1d1d23;
-  color: #d8d8de;
+  border: 1px solid #484848;
+  background: #262626;
+  color: #d2d2d2;
   font-size: 12px;
   padding: 4px 0;
   border-radius: 4px;
   cursor: pointer;
 }
 .add:hover { border-color: #4a9eff; color: #4a9eff; }
-.empty { font-size: 11px; color: #55555e; }
+.empty { font-size: 11px; color: #5c5c5c; }
 .row {
-  border: 1px solid #2a2a31;
+  border: 1px solid #424242;
   border-radius: 6px;
   padding: 6px 8px;
-  background: #1a1a20;
+  background: #242424;
   cursor: pointer;
 }
 .row.selected { border-color: #4a9eff; }
 .row-head { display: flex; align-items: center; gap: 6px; }
-.icon { color: #9a9aa4; width: 18px; text-align: center; }
-.name { flex: 1; font-size: 12px; color: #d8d8de; }
+.icon { color: #9a9a9a; width: 18px; text-align: center; }
+.name { flex: 1; font-size: 12px; color: #d2d2d2; }
 .chk { display: flex; align-items: center; }
 .mini {
-  border: 1px solid #2f2f38;
+  border: 1px solid #484848;
   background: transparent;
-  color: #9a9aa4;
+  color: #9a9a9a;
   font-size: 11px;
   padding: 2px 6px;
   border-radius: 3px;
   cursor: pointer;
 }
-.mini:hover { color: #d8d8de; border-color: #4a9eff; }
-.mini.danger:hover { color: #ff6b6b; border-color: #ff6b6b; }
+.mini:hover { color: #d2d2d2; border-color: #4a9eff; }
+.mini.danger:hover { color: #e06c75; border-color: #e06c75; }
 .row-body { margin-top: 6px; }
 .done-row { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
-.done-hint { flex: 1; font-size: 11px; color: #6d6d76; }
+.done-hint { flex: 1; font-size: 11px; color: #6e6e6e; }
 .done-btn {
   border: 1px solid #4a9eff;
   background: transparent;
@@ -216,12 +216,12 @@ function setGeom(i: number, field: 'feather' | 'size' | 'radius' | 'aspect' | 'a
 }
 .done-btn:hover { background: rgba(74, 158, 255, 0.12); }
 .s-row { display: flex; align-items: center; gap: 8px; padding: 2px 0; }
-.s-label { font-size: 11px; color: #b9b9c0; width: 56px; flex: none; }
+.s-label { font-size: 11px; color: #a6a6a6; width: 56px; flex: none; }
 .s-row :deep(.n-slider) { flex: 1; }
-.s-val { font-size: 11px; color: #e8e8ec; width: 44px; text-align: right;
+.s-val { font-size: 11px; color: #e2e2e2; width: 44px; text-align: right;
          font-variant-numeric: tabular-nums; flex: none; }
-.s-hint { font-size: 10px; color: #55555e; flex: 1; text-align: right; }
+.s-hint { font-size: 10px; color: #5c5c5c; flex: 1; text-align: right; }
 .brush-actions { display: flex; gap: 6px; padding-top: 4px; }
 .rot-btns { display: flex; gap: 4px; flex: 1; }
-.hint { font-size: 11px; color: #6d6d76; }
+.hint { font-size: 11px; color: #6e6e6e; }
 </style>

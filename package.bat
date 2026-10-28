@@ -41,6 +41,15 @@ if errorlevel 1 (
     )
 )
 
+rem onnxruntime：本地分割引擎运行时。打包前装好才能内置进 exe，
+rem 否则内置模型没有推理引擎可用（会退化为云端 VLM）。失败不阻断打包。
+.venv\Scripts\python.exe -c "import onnxruntime" 2>nul
+if errorlevel 1 (
+    echo [初始化] 安装 onnxruntime（本地分割引擎）...
+    .venv\Scripts\python.exe -m pip install --quiet --disable-pip-version-check onnxruntime
+    if errorlevel 1 ( echo [警告] onnxruntime 安装失败，打包后本地蒙版将退化为云端 VLM )
+)
+
 if not exist .venv\Scripts\pyinstaller.exe (
     echo [初始化] 安装 PyInstaller...
     .venv\Scripts\python.exe -m pip install pyinstaller

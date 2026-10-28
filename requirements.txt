@@ -1,13 +1,24 @@
+# PhotoLab 依赖
+# 核心运行时（server.py / core.py / auto.py / segment.py 必需）
 PySide6>=6.6,<7
 numpy>=1.26,<3
 opencv-python>=4.9,<6
-
-# Web 服务端（server.py，新版 Web UI 的后端）
 fastapi>=0.110
 uvicorn[standard]>=0.29
+pydantic>=2.6            # server.py 直接 import BaseModel（fastapi 也会传递依赖，这里显式声明版本下限）
 
-# 以下为可选依赖（run.bat 会自动尝试安装，失败不影响基本功能）：
-# rawpy       - RAW 解码（DNG/CR2/CR3/NEF/ARW 等）
-# pyopencl    - GPU 加速（需显卡驱动自带 OpenCL：NVIDIA / AMD / Intel 均可）
-# httpx       - 仅 tests_server.py 需要（fastapi.testclient）
-# pyinstaller - 仅桌面版打包 sidecar 需要（build/photolab-server.spec）
+# 可选依赖：缺失不影响基本功能，但会关闭对应特性。
+# 手动安装：  pip install rawpy pyopencl onnxruntime
+# 注意：package.bat 只安装本文件核心依赖，不会自动装下列可选包。
+#
+# rawpy        - RAW 解码（DNG/CR2/CR3/NEF/ARW/RW2/RAF/ORF 等，LibRaw）
+# pyopencl     - GPU 加速（需显卡驱动自带 OpenCL：NVIDIA / AMD / Intel 均可）
+#                仅纯逐像素阶段（白平衡/基础/黑白/曲线/颜色分级）走 OpenCL
+# onnxruntime  - 本地分割推理引擎：SAM2.1 像素级蒙版 + u2net + skyseg + yolov8n
+#                缺失时本地引擎不可用（segment_local 会抛错提示安装），
+#                但 auto.py 的 VLM 网格蒙版引擎不受影响。
+#                建议 onnxruntime>=1.16；GPU 版可用 onnxruntime-gpu。
+
+# 仅开发/测试需要（不要加进发布环境）：
+# httpx       - tests_server.py 的 fastapi.testclient 依赖
+# pyinstaller - 仅桌面版打包 sidecar 需要（package.bat 会单独 pip install）
